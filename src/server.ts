@@ -1,7 +1,6 @@
 import { createServer, type IncomingMessage } from "node:http";
-import { pathToFileURL } from "node:url";
 import { WebSocketServer } from "ws";
-import { loadConfig, type BridgeConfig } from "./config.js";
+import type { BridgeConfig } from "./config.js";
 import { isFresh, verify, SIGNATURE_HEADER, TIMESTAMP_HEADER } from "./hmac.js";
 import { logger } from "./log.js";
 import { CallSession, type ElConnector } from "./session.js";
@@ -76,8 +75,3 @@ export function startServer(cfg: BridgeConfig, connectEl?: ElConnector): ReturnT
   return httpServer;
 }
 
-// Entry point (skipped when imported by tests).
-const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
-if (isMain) {
-  startServer(loadConfig());
-}

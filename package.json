@@ -1,18 +1,55 @@
 {
-  "name": "elevenlabs-msteams-bridge",
+  "name": "@komaa/elevenlabs-msteams-bridge",
   "version": "0.1.0",
-  "description": "Bridge provider: terminates the OpenClawBridge worker wire protocol on one side and the ElevenLabs Agent WebSocket on the other. Brings Microsoft Teams voice/video calls to an ElevenLabs agent.",
+  "description": "Bridge Microsoft Teams voice/video calls to an ElevenLabs Agent. Terminates the OpenClawBridge worker wire protocol on one side and the ElevenLabs Agent WebSocket on the other.",
+  "keywords": [
+    "elevenlabs",
+    "microsoft-teams",
+    "voice",
+    "agent",
+    "websocket",
+    "bridge",
+    "telephony",
+    "conversational-ai"
+  ],
+  "license": "MIT",
+  "author": "Komaa",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/komaa/elevenlabs-msteams-bridge.git"
+  },
   "type": "module",
-  "main": "dist/server.js",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "elevenlabs-msteams-bridge": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    ".env.example"
+  ],
   "engines": {
     "node": ">=20"
   },
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "tsc",
-    "start": "node dist/server.js",
-    "dev": "tsx src/server.ts",
+    "start": "node dist/cli.js",
+    "dev": "tsx src/cli.ts",
     "test": "tsx --test test/*.test.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run typecheck && npm test && npm run build"
   },
   "dependencies": {
     "ws": "^8.18.0"

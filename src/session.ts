@@ -203,17 +203,72 @@ export class CallSession {
     }
   }
 
-  /** Map agent client tools → worker capabilities (spec §2). v1 ships end_call only. */
+  /**
+   * Map agent client tools → worker capabilities (spec §2):
+   * end_call → session.end, express → expression, show_image → display.image.
+   */
   private onClientToolCall(msg: ElClientToolCall): void {
     const call = msg.client_tool_call;
-    if (call.tool_name === "end_call") {
-      this.el?.sendClientToolResult(call.tool_call_id, "call ended", false);
-      this.log.info("agent requested end_call");
-      this.endCall("agent-ended-call");
-      return;
+    const params = call.parameters ?? {};
+    switch (call.tool_name) {
+      case "end_call":
+        this.el?.sendClientToolResult(call.tool_call_id, "call ended", false);
+        this.log.info("agent requested end_call");
+        this.endCall("agent-ended-call");
+        return;
+      case "express": {
+        const emotion = typeof params.emotion === "string" ? params.emotion : "";
+        if (!emotion) {
+          this.el?.sendClientToolResult(call.tool_call_id, "express requires an 'emotion' parameter", true);
+          return;
+        }
+        this.sendToWorker({ type: "expression", emotion });
+        this.el?.sendClientToolResult(call.tool_call_id, `expressing ${emotion}`, false);
+        return;
+      }
+      case "show_image":
+        void this.onShowImage(call.tool_call_id, params);
+        return;
+      default:
+        this.el?.sendClientToolResult(call.tool_call_id, `tool "${call.tool_name}" is not implemented by this bridge`, true);
+        this.log.warn(`unmapped client tool: ${call.tool_name}`);
     }
-    this.el?.sendClientToolResult(call.tool_call_id, `tool "${call.tool_name}" is not implemented by this bridge`, true);
-    this.log.warn(`unmapped client tool: ${call.tool_name}`);
+  }
+
+  /**
+   * show_image → display.image on the bot's video tile. Accepts either inline
+   * base64 ({dataBase64, mime}) or a URL the bridge fetches server-side.
+   */
+  private async onShowImage(toolCallId: string, params: Record<string, unknown>): Promise<void> {
+    try {
+      let dataBase64 = typeof params.dataBase64 === "string" ? params.dataBase64 : null;
+      let mime = typeof params.mime === "string" ? params.mime : null;
+      const url = typeof params.url === "string" ? params.url : null;
+      if (!dataBase64 && url) {
+        const res = await fetch(url);
+        if (!res.ok) {
+          throw new Error(`fetch ${url} → HTTP ${res.status}`);
+        }
+        mime = res.headers.get("content-type")?.split(";")[0] ?? "image/jpeg";
+        dataBase64 = Buffer.from(await res.arrayBuffer()).toString("base64");
+      }
+      if (!dataBase64 || !mime || !/^image\/(jpeg|png)$/.test(mime)) {
+        throw new Error("show_image needs {dataBase64, mime} or {url} resolving to image/jpeg or image/png");
+      }
+      this.sendToWorker({
+        type: "display.image",
+        dataBase64,
+        mime,
+        durationMs: typeof params.durationMs === "number" ? params.durationMs : null,
+        mode: typeof params.mode === "string" ? params.mode : null,
+        ts: 0,
+        caption: typeof params.caption === "string" ? params.caption : null,
+      });
+      this.el?.sendClientToolResult(toolCallId, "image is being shown to the caller", false);
+    } catch (err) {
+      this.log.warn(`show_image failed: ${(err as Error).message}`);
+      this.el?.sendClientToolResult(toolCallId, `show_image failed: ${(err as Error).message}`, true);
+    }
   }
 
   // ---- governor goodbye (spec §2 assistant.say) ----

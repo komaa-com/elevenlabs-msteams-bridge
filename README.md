@@ -1,6 +1,22 @@
-# elevenlabs-msteams-bridge
+# @komaa/elevenlabs-msteams-bridge
 
 Bring Microsoft Teams voice/video calls to an [ElevenLabs Agent](https://elevenlabs.io/docs/eleven-agents/api-reference/eleven-agents/websocket).
+
+```bash
+# run directly
+npx @komaa/elevenlabs-msteams-bridge
+
+# or install
+npm install @komaa/elevenlabs-msteams-bridge
+```
+
+As a library:
+
+```ts
+import { loadConfig, startServer } from "@komaa/elevenlabs-msteams-bridge";
+
+startServer(loadConfig()); // env-configured; see .env.example
+```
 
 This is the ElevenLabs **bridge provider** for the OpenClawBridge Teams media stack: the Windows MediaNode terminates Teams Graph Calling + Skype media and exposes each call as one WebSocket speaking a provider-agnostic wire protocol (`OpenClaw/Protocol.cs`). This service terminates that protocol on one side and an ElevenLabs Agent WebSocket on the other. The media worker needs **no code changes**.
 
@@ -22,15 +38,22 @@ Audio is relayed **verbatim** in both directions: both sides speak base64 PCM 16
 | 4. Governor goodbye (assistant.say → standalone TTS, user_message fallback) | Done |
 | 5. Vision on-demand (frames are buffered per source; upload/multimodal not wired yet) | Groundwork |
 | 6. Avatar | Nothing to do (RMS path, worker-side) |
-| 7. Client tools | `end_call` only; others return a tool error |
+| 7. Client tools | `end_call` → session.end, `express` → expression, `show_image` → display.image (inline base64 or bridge-fetched URL); unknown tools return a tool error |
 
 ## Run
 
 ```bash
+ELEVENLABS_API_KEY=... ELEVENLABS_AGENT_ID=agent_... WORKER_SHARED_SECRET=... \
+  npx @komaa/elevenlabs-msteams-bridge
+```
+
+From a checkout:
+
+```bash
 npm install
-npm test          # 10 tests: HMAC vectors, protocol parsing, full E2E relay
+npm test          # HMAC vectors, protocol parsing, full E2E relay incl. client tools
 npm run build
-ELEVENLABS_API_KEY=... ELEVENLABS_AGENT_ID=agent_... WORKER_SHARED_SECRET=... npm start
+npm start
 ```
 
 Then point the Teams identity's `OpenClawWsBaseUrl` at this service (e.g. `wss://el-bridge.internal:8080/voice/msteams/stream`) and set its `OpenClawSharedSecret` to the same value as `WORKER_SHARED_SECRET`. The worker dials `{base}/{callId}` per call.
