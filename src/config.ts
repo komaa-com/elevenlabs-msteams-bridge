@@ -29,6 +29,16 @@ export interface BridgeConfig {
   visionApiKey: string | null;
   /** Vision model name (required when visionApiUrl is set). */
   visionModel: string | null;
+  /**
+   * Bridge-side call governor (spec §9): hard cap on call duration in minutes
+   * (fractional allowed). 0 = disabled. ElevenLabs doesn't know about your
+   * billing; on limit the bridge speaks a goodbye and ends the call.
+   */
+  maxCallMinutes: number;
+  /** Goodbye line the governor speaks (deterministic via TTS when EL_TTS_VOICE_ID is set). */
+  goodbyeText: string;
+  /** How long to let the goodbye play out before session.end when its duration is unknown (user_message fallback). */
+  goodbyeGraceMs: number;
   /** Allowed clock skew for the HMAC timestamp, in ms (worker side documents ±60s). */
   hmacFreshnessMs: number;
   /** Log EL transcripts (still gated on Teams recording.status === "active", spec §7). */
@@ -59,6 +69,11 @@ export function loadConfig(): BridgeConfig {
     elEnvironment: optional("EL_ENVIRONMENT"),
     elTtsVoiceId: optional("EL_TTS_VOICE_ID"),
     elTtsModelId: process.env.EL_TTS_MODEL_ID ?? "eleven_turbo_v2_5",
+    maxCallMinutes: Number(process.env.MAX_CALL_MINUTES ?? 0),
+    goodbyeText:
+      process.env.GOODBYE_TEXT ??
+      "I'm sorry, we've reached the time limit for this call. Thank you for calling, goodbye!",
+    goodbyeGraceMs: Number(process.env.GOODBYE_GRACE_MS ?? 8000),
     visionApiUrl: optional("VISION_API_URL"),
     visionApiKey: optional("VISION_API_KEY"),
     visionModel: optional("VISION_MODEL"),
