@@ -3,7 +3,11 @@
 type Level = "debug" | "info" | "warn" | "error";
 
 const order: Record<Level, number> = { debug: 10, info: 20, warn: 30, error: 40 };
-const minLevel: Level = (process.env.LOG_LEVEL as Level) || "info";
+// Fall back to "info" for an unset OR invalid LOG_LEVEL. Without the `in order`
+// check, a typo (e.g. LOG_LEVEL=verbose) makes every `order[level] < order[minLevel]`
+// comparison NaN-false, so ALL levels (including debug) would emit.
+const requestedLevel = process.env.LOG_LEVEL as Level | undefined;
+const minLevel: Level = requestedLevel && requestedLevel in order ? requestedLevel : "info";
 
 function emit(level: Level, scope: string, msg: string, extra?: unknown): void {
   if (order[level] < order[minLevel]) {

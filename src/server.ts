@@ -108,6 +108,34 @@ function remoteKey(req: IncomingMessage): string {
   return req.socket.remoteAddress ?? "unknown";
 }
 
+// SIGTERM/SIGINT drain: on shutdown, gracefully end every live call (notify the
+// worker with session.end + close both sockets) instead of hard-dropping calls
+// on a redeploy — parity with the caller sibling's preStop/SIGTERM drain. Wired
+// exactly once per process (process.once) so repeated startServer calls (tests)
+// never accumulate listeners.
+const liveRegistries = new Set<Map<string, CallSession>>();
+let signalsWired = false;
+function wireDrainSignals(): void {
+  if (signalsWired) {
+    return;
+  }
+  signalsWired = true;
+  const drain = (sig: string): void => {
+    const sessions = [...liveRegistries].flatMap((m) => [...m.values()]);
+    log.info(`${sig}: draining ${sessions.length} live call(s)`);
+    for (const s of sessions) {
+      try {
+        s.shutdown("bridge-shutdown");
+      } catch {
+        /* keep draining the rest */
+      }
+    }
+    process.exit(0);
+  };
+  process.once("SIGTERM", () => drain("SIGTERM"));
+  process.once("SIGINT", () => drain("SIGINT"));
+}
+
 export function startServer(
   cfg: BridgeConfig,
   connectEl?: ElConnector,
@@ -120,6 +148,12 @@ export function startServer(
 
   let openConnections = 0;
   const perIp = new Map<string, number>();
+  // Live calls keyed by callId: rejects a duplicate callId (a fresh handshake
+  // for an already-live call would otherwise open a SECOND billed EL conversation
+  // for the same call) and backs the SIGTERM drain.
+  const sessions = new Map<string, CallSession>();
+  liveRegistries.add(sessions);
+  wireDrainSignals();
 
   const httpServer = createServer((req, res) => {
     if (req.url === "/healthz") {
@@ -151,6 +185,11 @@ export function startServer(
     const auth = authorizeUpgrade(cfg, req, replay);
     if ("error" in auth) {
       return reject(socket, "401 Unauthorized", auth.error, ip);
+    }
+    // A live session already owns this callId — a retry/rollout reconnect. Reject
+    // rather than spin up a second billed ElevenLabs conversation for one call.
+    if (sessions.has(auth.callId)) {
+      return reject(socket, "409 Conflict", `callId ${auth.callId.slice(0, 12)}… already has a live session`, ip);
     }
     wss.handleUpgrade(req, socket, head, (ws) => {
       openConnections++;
@@ -186,9 +225,19 @@ export function startServer(
         }
       });
 
-      new CallSession(cfg, ws, auth.callId, connectEl, vision === undefined ? makeVisionDescriber(cfg) : vision);
+      const session = new CallSession(
+        cfg,
+        ws,
+        auth.callId,
+        connectEl,
+        vision === undefined ? makeVisionDescriber(cfg) : vision,
+        () => sessions.delete(auth.callId), // evict on teardown (dedup + drain registry)
+      );
+      sessions.set(auth.callId, session);
     });
   });
+
+  httpServer.on("close", () => liveRegistries.delete(sessions));
 
   httpServer.listen(cfg.port, cfg.host, () => {
     log.info(`elevenlabs-msteams-bridge listening on ${cfg.host}:${cfg.port} (agent ${cfg.elevenLabsAgentId}, host ${cfg.elHost})`);
