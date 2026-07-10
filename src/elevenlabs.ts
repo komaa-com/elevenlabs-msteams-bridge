@@ -157,6 +157,10 @@ export async function uploadConversationFile(
   return body.file_id;
 }
 
+/** Hard time bound on the goodbye-TTS fetch so a hung endpoint can't hold the
+ *  governor's mute/goodbye open (the call's hard teardown deadline still fires). */
+const GOODBYE_TTS_TIMEOUT_MS = 10_000;
+
 /**
  * Standalone TTS for the deterministic governor goodbye (spec §2 assistant.say):
  * synthesize the exact text as raw PCM16K and return the bytes.
@@ -167,10 +171,14 @@ export async function synthesizeGoodbye(cfg: BridgeConfig, text: string): Promis
   }
   const url = new URL(`https://${cfg.elHost}/v1/text-to-speech/${cfg.elTtsVoiceId}`);
   url.searchParams.set("output_format", "pcm_16000");
+  // Time-bound the synth: the governor's hard teardown deadline is armed before
+  // this is awaited, but a fetch that hangs forever would still hold the promise
+  // (and the mute) open. Match show_image's 10s bound (H3).
   const res = await fetch(url, {
     method: "POST",
     headers: { "xi-api-key": cfg.elevenLabsApiKey, "content-type": "application/json" },
     body: JSON.stringify({ text, model_id: cfg.elTtsModelId }),
+    signal: AbortSignal.timeout(GOODBYE_TTS_TIMEOUT_MS),
   });
   if (!res.ok) {
     throw new Error(`TTS failed: HTTP ${res.status} ${await res.text().catch(() => "")}`);
