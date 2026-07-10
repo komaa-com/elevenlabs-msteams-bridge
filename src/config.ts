@@ -19,6 +19,10 @@ export interface BridgeConfig {
   elHost: string;
   /** Optional environment passed to get-signed-url and conversation_initiation_client_data (spec §6). */
   elEnvironment: string | null;
+  /** Optional localized greeting / spoken disclosure sent as a first_message override (must be allowlisted on the agent). */
+  elFirstMessage: string | null;
+  /** Optional agent branch id pinned per deployment (spec §6). */
+  elAgentBranchId: string | null;
   /** Voice id for the deterministic governor goodbye via standalone TTS (spec §2 assistant.say). Null = fall back to user_message injection. */
   elTtsVoiceId: string | null;
   /** TTS model for the goodbye line. */
@@ -67,6 +71,8 @@ export function loadConfig(): BridgeConfig {
     elevenLabsAgentId: required("ELEVENLABS_AGENT_ID"),
     elHost: process.env.EL_HOST ?? "api.elevenlabs.io",
     elEnvironment: optional("EL_ENVIRONMENT"),
+    elFirstMessage: optional("EL_FIRST_MESSAGE"),
+    elAgentBranchId: optional("EL_AGENT_BRANCH_ID"),
     elTtsVoiceId: optional("EL_TTS_VOICE_ID"),
     elTtsModelId: process.env.EL_TTS_MODEL_ID ?? "eleven_turbo_v2_5",
     maxCallMinutes: Number(process.env.MAX_CALL_MINUTES ?? 0),
