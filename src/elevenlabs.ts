@@ -243,9 +243,12 @@ export class ElAgentSocket implements AgentPort {
         if (meta?.conversation_id) {
           sock.conversationId = meta.conversation_id;
         }
-        // pcm_16000 is the no-transcode contract (spec §4); anything else is an agent misconfig.
+        // pcm_16000 both ways is the no-transcode contract (spec §4); anything else is an agent misconfig.
         if (meta?.agent_output_audio_format && meta.agent_output_audio_format !== "pcm_16000") {
           log.error(`agent_output_audio_format is ${meta.agent_output_audio_format}, expected pcm_16000 — fix the agent's audio settings`);
+        }
+        if (meta?.user_input_audio_format && meta.user_input_audio_format !== "pcm_16000") {
+          log.error(`user_input_audio_format is ${meta.user_input_audio_format}, expected pcm_16000 — fix the agent's audio settings`);
         }
       }
       try {

@@ -78,6 +78,35 @@ export function isForbiddenIp(ip: string): boolean {
 }
 
 /**
+ * Read a fetch Response body with a hard byte cap: rejects on Content-Length
+ * upfront, then streams with a running total so an oversized (or lying) server
+ * can't balloon memory before the size check.
+ */
+export async function readBodyWithCap(res: Response, maxBytes: number): Promise<Buffer> {
+  const declared = Number(res.headers.get("content-length") ?? NaN);
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    throw new Error(`response too large (${declared} bytes, max ${maxBytes})`);
+  }
+  if (!res.body) {
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (buf.length > maxBytes) {
+      throw new Error(`response too large (${buf.length} bytes, max ${maxBytes})`);
+    }
+    return buf;
+  }
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const chunk of res.body as AsyncIterable<Uint8Array>) {
+    total += chunk.length;
+    if (total > maxBytes) {
+      throw new Error(`response exceeded ${maxBytes} bytes; aborting read`);
+    }
+    chunks.push(Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks);
+}
+
+/**
  * Validate an outbound URL: http(s) only, no credentials, and every address the
  * host resolves to must be public. Throws with a reason on rejection.
  */
