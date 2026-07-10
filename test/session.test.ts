@@ -1,0 +1,188 @@
+import { test, after } from "node:test";
+import assert from "node:assert/strict";
+import WebSocket from "ws";
+import type { AddressInfo } from "node:net";
+import { startServer } from "../src/server.js";
+import { sign } from "../src/hmac.js";
+import type { BridgeConfig } from "../src/config.js";
+import type { AgentPort, ElInbound, ElSessionHandlers } from "../src/elevenlabs.js";
+
+const cfg: BridgeConfig = {
+  port: 0,
+  host: "127.0.0.1",
+  workerSharedSecret: "test-secret",
+  elevenLabsApiKey: "unused-in-tests",
+  elevenLabsAgentId: "agent_test",
+  elHost: "api.elevenlabs.io",
+  elEnvironment: null,
+  elTtsVoiceId: null, // goodbye falls back to user_message
+  elTtsModelId: "eleven_turbo_v2_5",
+  hmacFreshnessMs: 60_000,
+  logTranscripts: false,
+};
+
+/** Fake ElevenLabs agent: records what the bridge sends, lets tests push events back. */
+class FakeAgent implements AgentPort {
+  conversationId = "conv_fake";
+  isOpen = true;
+  sent: Array<Record<string, unknown>> = [];
+  closed = false;
+  handlers!: ElSessionHandlers;
+
+  sendAudioChunk(b64: string): void {
+    this.sent.push({ user_audio_chunk: b64 });
+  }
+  sendConversationInit(init: Record<string, unknown>): void {
+    this.sent.push(init);
+  }
+  sendPong(eventId: number): void {
+    this.sent.push({ type: "pong", event_id: eventId });
+  }
+  sendContextualUpdate(text: string): void {
+    this.sent.push({ type: "contextual_update", text });
+  }
+  sendUserMessage(text: string): void {
+    this.sent.push({ type: "user_message", text });
+  }
+  sendClientToolResult(toolCallId: string, result: string, isError: boolean): void {
+    this.sent.push({ type: "client_tool_result", tool_call_id: toolCallId, result, is_error: isError });
+  }
+  close(): void {
+    this.closed = true;
+  }
+  emit(msg: ElInbound): void {
+    this.handlers.onMessage(msg);
+  }
+}
+
+const fakeAgent = new FakeAgent();
+const connectEl = async (_cfg: BridgeConfig, _log: unknown, handlers: ElSessionHandlers): Promise<AgentPort> => {
+  fakeAgent.handlers = handlers;
+  return fakeAgent;
+};
+
+const server = startServer(cfg, connectEl);
+await new Promise<void>((r) => server.once("listening", () => r()));
+const port = (server.address() as AddressInfo).port;
+after(() => server.close());
+
+const CALL_ID = "call-e2e-1";
+
+function workerUrl(callId: string, opts?: { badSig?: boolean; staleTs?: boolean }): { url: string; headers: Record<string, string> } {
+  const ts = opts?.staleTs ? Date.now() - 3_600_000 : Date.now();
+  const sig = opts?.badSig ? "0".repeat(64) : sign(cfg.workerSharedSecret, ts, callId);
+  return {
+    url: `ws://127.0.0.1:${port}/voice/msteams/stream/${callId}`,
+    headers: { "X-OpenClawTeamsBridge-Timestamp": String(ts), "X-OpenClawTeamsBridge-Signature": sig },
+  };
+}
+
+function nextMessage(ws: WebSocket): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    ws.once("message", (d) => resolve(JSON.parse(d.toString())));
+    ws.once("error", reject);
+    ws.once("close", () => reject(new Error("socket closed while waiting for message")));
+  });
+}
+
+function until<T>(fn: () => T | undefined, timeoutMs = 2000): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const start = Date.now();
+    const tick = () => {
+      const v = fn();
+      if (v !== undefined) return resolve(v);
+      if (Date.now() - start > timeoutMs) return reject(new Error("until() timed out"));
+      setTimeout(tick, 10);
+    };
+    tick();
+  });
+}
+
+test("rejects a bad signature with 401", async () => {
+  const { url, headers } = workerUrl("call-unauth", { badSig: true });
+  const ws = new WebSocket(url, { headers });
+  const err = await new Promise<Error>((r) => ws.once("error", r));
+  assert.match(err.message, /401/);
+});
+
+test("rejects a stale timestamp", async () => {
+  const { url, headers } = workerUrl("call-stale", { staleTs: true });
+  const ws = new WebSocket(url, { headers });
+  const err = await new Promise<Error>((r) => ws.once("error", r));
+  assert.match(err.message, /401/);
+});
+
+test("full relay: init, audio both ways, barge-in ghosts, ping/pong, context, goodbye", async () => {
+  const { url, headers } = workerUrl(CALL_ID);
+  const ws = new WebSocket(url, { headers });
+  await new Promise<void>((r) => ws.once("open", () => r()));
+
+  // session.start → bridge opens (fake) EL and sends conversation init with defaulted nullables
+  ws.send(JSON.stringify({
+    type: "session.start",
+    callId: CALL_ID,
+    threadId: "19:thread",
+    caller: { aadId: null, displayName: "Alaa", tenantId: null },
+    direction: "inbound",
+  }));
+  const init = await until(() => fakeAgent.sent.find((m) => m.type === "conversation_initiation_client_data"));
+  const dyn = init.dynamic_variables as Record<string, string>;
+  assert.equal(dyn.caller_name, "Alaa");
+  assert.equal(dyn.tenant_id, "unknown-tenant"); // nullable → defaulted, never null
+
+  // caller audio → EL verbatim
+  ws.send(JSON.stringify({ type: "audio.frame", seq: 1, timestampMs: 20, payloadBase64: "UENNMTZL" }));
+  await until(() => fakeAgent.sent.find((m) => m.user_audio_chunk === "UENNMTZL"));
+
+  // EL audio → worker audio.frame with seq/timestamp bookkeeping (640 bytes = 20ms)
+  const pcm640 = Buffer.alloc(640).toString("base64");
+  const audioP = nextMessage(ws);
+  fakeAgent.emit({ type: "audio", audio_event: { audio_base_64: pcm640, event_id: 1 } });
+  const frame1 = await audioP;
+  assert.equal(frame1.type, "audio.frame");
+  assert.equal(frame1.seq, 0);
+  assert.equal(frame1.timestampMs, 0);
+
+  const audio2P = nextMessage(ws);
+  fakeAgent.emit({ type: "audio", audio_event: { audio_base_64: pcm640, event_id: 2 } });
+  const frame2 = await audio2P;
+  assert.equal(frame2.seq, 1);
+  assert.equal(frame2.timestampMs, 20); // advanced by the first frame's real duration
+
+  // interruption → assistant.cancel with turnId = event_id; stale audio (event_id ≤ 5) is dropped
+  const cancelP = nextMessage(ws);
+  fakeAgent.emit({ type: "interruption", interruption_event: { event_id: 5 } });
+  const cancel = await cancelP;
+  assert.equal(cancel.type, "assistant.cancel");
+  assert.equal(cancel.turnId, 5);
+
+  const afterCancelP = nextMessage(ws);
+  fakeAgent.emit({ type: "audio", audio_event: { audio_base_64: pcm640, event_id: 4 } }); // ghost — dropped
+  fakeAgent.emit({ type: "audio", audio_event: { audio_base_64: pcm640, event_id: 6 } }); // fresh — relayed
+  const frame3 = await afterCancelP;
+  assert.equal(frame3.seq, 2, "ghost audio must be dropped, fresh audio relayed");
+
+  // worker ping → pong echoing ts
+  const pongP = nextMessage(ws);
+  ws.send(JSON.stringify({ type: "ping", ts: 12345 }));
+  assert.deepEqual(await pongP, { type: "pong", ts: 12345 });
+
+  // EL ping → EL pong with event_id
+  fakeAgent.emit({ type: "ping", ping_event: { event_id: 77 } });
+  await until(() => fakeAgent.sent.find((m) => m.type === "pong" && m.event_id === 77));
+
+  // participants + dtmf → contextual updates
+  ws.send(JSON.stringify({ type: "participants", count: 3 }));
+  await until(() => fakeAgent.sent.find((m) => m.type === "contextual_update" && String(m.text).includes("3 human participants")));
+  ws.send(JSON.stringify({ type: "dtmf", digit: "7" }));
+  await until(() => fakeAgent.sent.find((m) => m.type === "contextual_update" && String(m.text).includes('"7"')));
+
+  // governor goodbye without a TTS voice → user_message fallback
+  ws.send(JSON.stringify({ type: "assistant.say", text: "Goodbye, thanks for calling." }));
+  await until(() => fakeAgent.sent.find((m) => m.type === "user_message" && String(m.text).includes("Goodbye")));
+
+  // session.end → both sides torn down
+  ws.send(JSON.stringify({ type: "session.end", reason: "call-ended" }));
+  await until(() => (fakeAgent.closed ? true : undefined));
+  await until(() => (ws.readyState === WebSocket.CLOSED ? true : undefined));
+});
