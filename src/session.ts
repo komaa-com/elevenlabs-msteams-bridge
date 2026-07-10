@@ -30,6 +30,10 @@ const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 /** Pending caller-audio cap while EL connects: 250 × 20 ms = 5 s. */
 const MAX_PENDING_AUDIO_FRAMES = 250;
 
+/** Outbound (bridge→worker) send-buffer cap. Above this, drop realtime frames
+ *  instead of letting a stalled worker balloon memory. Matches the siblings. */
+const MAX_OUTBOUND_BUFFER_BYTES = 1 * 1024 * 1024;
+
 /** Injectable EL connector so tests can substitute a fake agent. */
 export type ElConnector = (cfg: BridgeConfig, log: Logger, handlers: ElSessionHandlers) => Promise<AgentPort>;
 
@@ -494,9 +498,18 @@ export class CallSession {
   }
 
   private sendToWorker(msg: WorkerOutbound): void {
-    if (this.worker.readyState === this.worker.OPEN) {
-      this.worker.send(JSON.stringify(msg));
+    if (this.worker.readyState !== this.worker.OPEN) {
+      return;
     }
+    // Backpressure guard: ws.send is fire-and-forget, so if the worker stalls,
+    // bufferedAmount grows unbounded (50 audio.frames/s) and leaks memory.
+    // Above the cap, drop this frame rather than queue it — audio is realtime,
+    // a stale frame is worthless, and this bounds memory (parity with siblings).
+    if (this.worker.bufferedAmount > MAX_OUTBOUND_BUFFER_BYTES) {
+      this.log.warn(`dropping ${msg.type} — worker send buffer backpressure (${this.worker.bufferedAmount} bytes)`);
+      return;
+    }
+    this.worker.send(JSON.stringify(msg));
   }
 
   /** Ask the worker to tear the call down, then close both sockets. */
