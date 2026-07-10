@@ -58,6 +58,9 @@ export class CallSession {
   // vision groundwork (spec §5): latest inbound frame per source, memory only
   private readonly latestVideoFrame = new Map<string, VideoFrameMessage>();
 
+  // bridge-side call governor (spec §9)
+  private governorTimer: NodeJS.Timeout | null = null;
+
   constructor(
     cfg: BridgeConfig,
     worker: WebSocket,
@@ -117,7 +120,8 @@ export class CallSession {
         this.latestVideoFrame.set(msg.source, msg); // buffered for on-demand vision (§5); not persisted
         break;
       case "assistant.say":
-        void this.onGovernorGoodbye(msg.text);
+        // worker-side governor (H4): speak, the worker tears down afterwards
+        void this.speakGoodbye(msg.text);
         break;
       case "session.end":
         this.log.info(`session.end from worker: ${msg.reason}`);
@@ -165,6 +169,25 @@ export class CallSession {
       }),
     );
     this.log.info("ElevenLabs agent session open; relaying");
+
+    // Bridge-side governor (spec §9): ElevenLabs doesn't know about your billing.
+    if (this.cfg.maxCallMinutes > 0) {
+      const limitMs = this.cfg.maxCallMinutes * 60_000;
+      this.governorTimer = setTimeout(() => void this.onGovernorLimit(), limitMs);
+      this.log.info(`governor armed: max ${this.cfg.maxCallMinutes} min`);
+    }
+  }
+
+  /** Time limit hit: speak the goodbye, let it play out, then tear the call down. */
+  private async onGovernorLimit(): Promise<void> {
+    if (this.closed) {
+      return;
+    }
+    this.log.info("governor: call time limit reached");
+    const playedMs = await this.speakGoodbye(this.cfg.goodbyeText);
+    // deterministic TTS reports its real duration; the agent-side fallback doesn't
+    const graceMs = playedMs ?? this.cfg.goodbyeGraceMs;
+    setTimeout(() => this.endCall("time-limit"), graceMs + 500);
   }
 
   // ---- EL → bridge ----
@@ -343,20 +366,24 @@ export class CallSession {
 
   // ---- governor goodbye (spec §2 assistant.say) ----
 
-  private async onGovernorGoodbye(text: string): Promise<void> {
-    this.log.info("assistant.say (governor goodbye)");
+  /**
+   * Speak a goodbye line. Preferred: deterministic, the exact text via
+   * standalone TTS (returns the real audio duration in ms). Fallback: ask the
+   * agent itself via user_message (returns null, duration unknown).
+   */
+  private async speakGoodbye(text: string): Promise<number | null> {
+    this.log.info("speaking goodbye");
     if (this.cfg.elTtsVoiceId) {
       try {
-        // Preferred: deterministic — synthesize the exact line via standalone TTS
         const pcm = await synthesizeGoodbye(this.cfg, text);
         this.emitAudioToWorker(pcm.toString("base64"));
-        return;
+        return pcm16kBytesToMs(pcm.length);
       } catch (err) {
         this.log.warn(`goodbye TTS failed (${(err as Error).message}); falling back to user_message`);
       }
     }
-    // Fallback: ask the agent itself to say goodbye
-    this.el?.sendUserMessage(`[system: the call is about to end due to a time limit — say a brief goodbye now: "${text}"]`);
+    this.el?.sendUserMessage(`[system: the call is about to end due to a time limit. Say a brief goodbye now: "${text}"]`);
+    return null;
   }
 
   // ---- plumbing ----
@@ -393,6 +420,10 @@ export class CallSession {
     }
     this.closed = true;
     this.log.info(`teardown: ${reason}`);
+    if (this.governorTimer) {
+      clearTimeout(this.governorTimer);
+      this.governorTimer = null;
+    }
     try {
       this.el?.close();
     } catch {

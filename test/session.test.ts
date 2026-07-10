@@ -17,6 +17,12 @@ const cfg: BridgeConfig = {
   elEnvironment: null,
   elTtsVoiceId: null, // goodbye falls back to user_message
   elTtsModelId: "eleven_turbo_v2_5",
+  maxCallMinutes: 0,
+  goodbyeText: "Time limit reached, goodbye!",
+  goodbyeGraceMs: 8000,
+  visionApiUrl: null,
+  visionApiKey: null,
+  visionModel: null,
   hmacFreshnessMs: 60_000,
   logTranscripts: false,
 };
@@ -247,6 +253,37 @@ test("full relay: init, audio both ways, barge-in ghosts, ping/pong, context, go
   ws.send(JSON.stringify({ type: "session.end", reason: "call-ended" }));
   await until(() => (fakeAgent.closed ? true : undefined));
   await until(() => (ws.readyState === WebSocket.CLOSED ? true : undefined));
+});
+
+test("bridge-side governor: time limit → goodbye → session.end to worker", async () => {
+  const fakeAgentC = new FakeAgent();
+  const connectElC = async (_c: BridgeConfig, _l: unknown, handlers: ElSessionHandlers): Promise<AgentPort> => {
+    fakeAgentC.handlers = handlers;
+    return fakeAgentC;
+  };
+  // 0.002 min = 120ms limit; grace 40ms since the user_message fallback has unknown duration
+  const serverC = startServer({ ...cfg, maxCallMinutes: 0.002, goodbyeGraceMs: 40 }, connectElC, null);
+  await new Promise<void>((r) => serverC.once("listening", () => r()));
+  const portC = (serverC.address() as AddressInfo).port;
+
+  const callId = "call-governor-1";
+  const ts = Date.now();
+  const ws = new WebSocket(`ws://127.0.0.1:${portC}/voice/msteams/stream/${callId}`, {
+    headers: { "X-OpenClawTeamsBridge-Timestamp": String(ts), "X-OpenClawTeamsBridge-Signature": sign(cfg.workerSharedSecret, ts, callId) },
+  });
+  await new Promise<void>((r) => ws.once("open", () => r()));
+  const received: Array<Record<string, unknown>> = [];
+  ws.on("message", (d) => received.push(JSON.parse(d.toString())));
+
+  ws.send(JSON.stringify({ type: "session.start", callId, threadId: "t", caller: {} }));
+
+  // goodbye fallback fires at the limit, then session.end after the grace
+  await until(() => fakeAgentC.sent.find((m) => m.type === "user_message" && String(m.text).includes("Time limit reached")));
+  const end = await until(() => received.find((m) => m.type === "session.end"));
+  assert.equal(end.reason, "time-limit");
+  await until(() => (fakeAgentC.closed ? true : undefined));
+  await until(() => (ws.readyState === WebSocket.CLOSED ? true : undefined));
+  serverC.close();
 });
 
 test("look uses vision path 2 (describe) when a vision endpoint is configured — no upload, no gate", async () => {

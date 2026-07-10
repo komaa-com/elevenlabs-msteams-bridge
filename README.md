@@ -39,6 +39,7 @@ Audio is relayed **verbatim** in both directions: both sides speak base64 PCM 16
 | 5. Vision on-demand (`look` client tool; path 2 describe-then-answer via any OpenAI-compatible vision endpoint, path 1 file upload + `multimodal_message`, recording-gated) | Done |
 | 6. Avatar | Nothing to do (RMS path, worker-side) |
 | 7. Client tools | `end_call` → session.end, `express` → expression, `show_image` → display.image (inline base64 or bridge-fetched URL), `look` → vision; unknown tools return a tool error |
+| §9 governor | Bridge-side hard cap (`MAX_CALL_MINUTES`): goodbye (deterministic TTS or agent fallback), then `session.end reason=time-limit` |
 
 ## Run
 
@@ -75,6 +76,13 @@ Define a client tool named `look` on the agent (parameters: optional `source` = 
 2. **Path 1 (fallback):** the frame is uploaded to the live ElevenLabs conversation and injected as a `multimodal_message` (the agent's LLM must be multimodal). Because this **persists** the frame with a third party, it is refused unless Teams recording is `active`.
 
 The other client tools the bridge maps: `end_call`, `express` (`{emotion}`), `show_image` (`{dataBase64, mime}` or `{url}`, jpeg/png).
+
+## Call governor
+
+Two governors can end a call gracefully; both speak before hanging up:
+
+- **Worker-side** (existing H4 behavior): the MediaNode sends `assistant.say` with the goodbye text; the bridge speaks it (exact text via standalone TTS when `EL_TTS_VOICE_ID` is set, otherwise the agent is asked to say it) and the worker tears the call down.
+- **Bridge-side** (`MAX_CALL_MINUTES` > 0): the bridge arms a timer at `session.start`. On expiry it speaks `GOODBYE_TEXT`, waits for the audio to play out (real TTS duration, or `GOODBYE_GRACE_MS` when unknown), then sends `session.end` with reason `time-limit`. Use this when the billing limit lives with the bridge operator, since ElevenLabs knows nothing about your budget.
 
 ## Privacy / recording gate
 
