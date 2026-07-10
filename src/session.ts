@@ -22,6 +22,10 @@ import {
   type ElSessionHandlers,
 } from "./elevenlabs.js";
 import { makeVisionDescriber, type VisionDescriber } from "./vision.js";
+import { assertPublicHttpUrl } from "./ssrf.js";
+
+/** show_image fetch cap: display.image goes to a 640×360 tile; 5 MB is generous. */
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 
 /** Injectable EL connector so tests can substitute a fake agent. */
 export type ElConnector = (cfg: BridgeConfig, log: Logger, handlers: ElSessionHandlers) => Promise<AgentPort>;
@@ -166,6 +170,11 @@ export class CallSession {
           call_direction: msg.direction?.trim() || "inbound",
         },
         environment: this.cfg.elEnvironment,
+        firstMessage: this.cfg.elFirstMessage,
+        // per-person memory: AAD id when known; omitted for guests/anonymous so
+        // distinct callers never share an identity (Protocol.cs CallerInfo note)
+        userId: msg.caller?.aadId?.trim() || null,
+        branchId: this.cfg.elAgentBranchId,
       }),
     );
     this.log.info("ElevenLabs agent session open; relaying");
@@ -184,6 +193,11 @@ export class CallSession {
       return;
     }
     this.log.info("governor: call time limit reached");
+    // Flush first: the worker may still have buffered agent audio that would
+    // otherwise delay the goodbye past the grace window. Also stop relaying any
+    // further agent audio so the agent can't talk over the goodbye.
+    this.lastInterruptEventId = Number.MAX_SAFE_INTEGER;
+    this.sendToWorker({ type: "assistant.cancel", turnId: 0 });
     const playedMs = await this.speakGoodbye(this.cfg.goodbyeText);
     // deterministic TTS reports its real duration; the agent-side fallback doesn't
     const graceMs = playedMs ?? this.cfg.goodbyeGraceMs;
@@ -193,9 +207,16 @@ export class CallSession {
   // ---- EL → bridge ----
 
   private onElMessage(msg: ElInbound): void {
+    // Defensive: one malformed EL frame must never throw out of the ws message
+    // listener (that would be an uncaught exception → process down). Guard the
+    // nested event objects like parseWorkerMessage guards the worker side.
     switch (msg.type) {
       case "audio": {
         const ev = (msg as ElAudioEvent).audio_event;
+        if (!ev || typeof ev.event_id !== "number" || typeof ev.audio_base_64 !== "string") {
+          this.log.warn("EL audio frame missing audio_event/event_id/audio_base_64; dropping");
+          return;
+        }
         if (ev.event_id <= this.lastInterruptEventId) {
           this.log.debug(`dropping ghost audio event ${ev.event_id} (interrupted at ${this.lastInterruptEventId})`);
           return;
@@ -205,6 +226,10 @@ export class CallSession {
       }
       case "interruption": {
         const ev = (msg as ElInterruption).interruption_event;
+        if (!ev || typeof ev.event_id !== "number") {
+          this.log.warn("EL interruption missing interruption_event/event_id; dropping");
+          return;
+        }
         this.lastInterruptEventId = Math.max(this.lastInterruptEventId, ev.event_id);
         // TurnId = EL event_id; the worker's FlushPlayback ignores the value but the field must serialize (spec §2)
         this.sendToWorker({ type: "assistant.cancel", turnId: ev.event_id });
@@ -213,6 +238,10 @@ export class CallSession {
       }
       case "ping": {
         const ev = (msg as ElPing).ping_event;
+        if (!ev || typeof ev.event_id !== "number") {
+          this.log.warn("EL ping missing ping_event/event_id; dropping");
+          return;
+        }
         this.el?.sendPong(ev.event_id);
         break;
       }
@@ -224,9 +253,15 @@ export class CallSession {
         }
         break;
       }
-      case "client_tool_call":
+      case "client_tool_call": {
+        const call = (msg as ElClientToolCall).client_tool_call;
+        if (!call || typeof call.tool_name !== "string" || typeof call.tool_call_id !== "string") {
+          this.log.warn("EL client_tool_call missing tool_name/tool_call_id; dropping");
+          return;
+        }
         this.onClientToolCall(msg as ElClientToolCall);
         break;
+      }
       case "conversation_initiation_metadata":
       case "vad_score":
         break; // metadata handled in ElAgentSocket; vad is informational
@@ -280,12 +315,19 @@ export class CallSession {
       let mime = typeof params.mime === "string" ? params.mime : null;
       const url = typeof params.url === "string" ? params.url : null;
       if (!dataBase64 && url) {
-        const res = await fetch(url);
+        // SSRF guard: the URL is agent-(LLM-)controlled, i.e. indirectly caller-controlled.
+        // Public hosts only, no redirects (rebind bypass), bounded time and size.
+        const safeUrl = await assertPublicHttpUrl(url);
+        const res = await fetch(safeUrl, { redirect: "error", signal: AbortSignal.timeout(10_000) });
         if (!res.ok) {
           throw new Error(`fetch ${url} → HTTP ${res.status}`);
         }
         mime = res.headers.get("content-type")?.split(";")[0] ?? "image/jpeg";
-        dataBase64 = Buffer.from(await res.arrayBuffer()).toString("base64");
+        const body = Buffer.from(await res.arrayBuffer());
+        if (body.length > MAX_IMAGE_BYTES) {
+          throw new Error(`image too large (${body.length} bytes, max ${MAX_IMAGE_BYTES})`);
+        }
+        dataBase64 = body.toString("base64");
       }
       if (!dataBase64 || !mime || !/^image\/(jpeg|png)$/.test(mime)) {
         throw new Error("show_image needs {dataBase64, mime} or {url} resolving to image/jpeg or image/png");
@@ -348,11 +390,15 @@ export class CallSession {
         );
         return;
       }
+      const el = this.el;
+      if (!el) {
+        throw new Error("agent connection is not open");
+      }
       const who =
         frame.source === "screenshare"
           ? `screen shared by ${frame.participantName ?? "a participant"}`
           : `camera of ${frame.participantName ?? "the caller"}`;
-      await this.el!.attachImage(
+      await el.attachImage(
         Buffer.from(frame.dataBase64, "base64"),
         frame.mime,
         `[live Teams frame: ${who}] ${question}`,

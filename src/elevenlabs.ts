@@ -69,8 +69,17 @@ export type ElInbound =
 
 export interface ConversationInitOptions {
   dynamicVariables: Record<string, string>;
-  firstMessage?: string;
+  firstMessage?: string | null;
   environment?: string | null;
+  /**
+   * Stable per-person id for ElevenLabs analytics/memory. Pass the caller's
+   * AAD id when present; NEVER a shared default — distinct anonymous callers
+   * must not collide on one id (cross-caller memory bleed, see Protocol.cs
+   * CallerInfo). Omitted when null.
+   */
+  userId?: string | null;
+  /** Pin a specific agent branch (per-tenant variants). Omitted when null. */
+  branchId?: string | null;
 }
 
 export function buildConversationInit(opts: ConversationInitOptions): Record<string, unknown> {
@@ -85,6 +94,12 @@ export function buildConversationInit(opts: ConversationInitOptions): Record<str
   }
   if (opts.environment) {
     msg.environment = opts.environment;
+  }
+  if (opts.userId) {
+    msg.user_id = opts.userId;
+  }
+  if (opts.branchId) {
+    msg.branch_id = opts.branchId;
   }
   return msg;
 }
@@ -199,16 +214,21 @@ export class ElAgentSocket implements AgentPort {
     this.cfg = cfg;
   }
 
-  /** Open the agent WS (signed URL) and wire handlers. Resolves once the socket is open. */
+  /**
+   * Open the agent WS and wire handlers. Resolves once the socket is open.
+   * One retry with a fresh signed URL (spec §6 refresh-on-failure): signed URLs
+   * are short-lived and a transient mint/connect failure should not hang up.
+   */
   static async connect(cfg: BridgeConfig, log: Logger, handlers: ElSessionHandlers): Promise<ElAgentSocket> {
-    const signedUrl = await getSignedUrl(cfg);
-    const ws = new WebSocket(signedUrl);
+    let ws: WebSocket;
+    try {
+      ws = await ElAgentSocket.openOnce(cfg);
+    } catch (err) {
+      log.warn(`EL connect failed (${(err as Error).message}); retrying with a fresh signed URL`);
+      await new Promise((r) => setTimeout(r, 250));
+      ws = await ElAgentSocket.openOnce(cfg);
+    }
     const sock = new ElAgentSocket(ws, log, cfg);
-
-    await new Promise<void>((resolve, reject) => {
-      ws.once("open", () => resolve());
-      ws.once("error", (err) => reject(err));
-    });
 
     ws.on("message", (data) => {
       let msg: ElInbound | null = null;
@@ -220,17 +240,36 @@ export class ElAgentSocket implements AgentPort {
       }
       if (msg.type === "conversation_initiation_metadata") {
         const meta = (msg as ElInitMetadata).conversation_initiation_metadata_event;
-        sock.conversationId = meta.conversation_id;
+        if (meta?.conversation_id) {
+          sock.conversationId = meta.conversation_id;
+        }
         // pcm_16000 is the no-transcode contract (spec §4); anything else is an agent misconfig.
-        if (meta.agent_output_audio_format && meta.agent_output_audio_format !== "pcm_16000") {
+        if (meta?.agent_output_audio_format && meta.agent_output_audio_format !== "pcm_16000") {
           log.error(`agent_output_audio_format is ${meta.agent_output_audio_format}, expected pcm_16000 — fix the agent's audio settings`);
         }
       }
-      handlers.onMessage(msg);
+      try {
+        handlers.onMessage(msg);
+      } catch (err) {
+        // Never let a handler throw escape the ws listener — that is an
+        // uncaught exception and takes the whole process (all calls) down.
+        log.error(`error handling EL ${msg.type}: ${(err as Error).message}`);
+      }
     });
     ws.on("close", (code, reason) => handlers.onClose(code, reason.toString("utf8")));
     ws.on("error", (err) => handlers.onError(err as Error));
     return sock;
+  }
+
+  /** Mint a signed URL and open the socket once; rejects on either failure. */
+  private static async openOnce(cfg: BridgeConfig): Promise<WebSocket> {
+    const signedUrl = await getSignedUrl(cfg);
+    const ws = new WebSocket(signedUrl);
+    await new Promise<void>((resolve, reject) => {
+      ws.once("open", () => resolve());
+      ws.once("error", (err) => reject(err));
+    });
+    return ws;
   }
 
   get isOpen(): boolean {

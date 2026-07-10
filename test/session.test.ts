@@ -17,6 +17,8 @@ const cfg: BridgeConfig = {
   elEnvironment: null,
   elTtsVoiceId: null, // goodbye falls back to user_message
   elTtsModelId: "eleven_turbo_v2_5",
+  elFirstMessage: null,
+  elAgentBranchId: null,
   maxCallMinutes: 0,
   goodbyeText: "Time limit reached, goodbye!",
   goodbyeGraceMs: 8000,
@@ -151,6 +153,7 @@ test("full relay: init, audio both ways, barge-in ghosts, ping/pong, context, go
   const dyn = init.dynamic_variables as Record<string, string>;
   assert.equal(dyn.caller_name, "Alaa");
   assert.equal(dyn.tenant_id, "unknown-tenant"); // nullable → defaulted, never null
+  assert.equal("user_id" in init, false, "no aadId → user_id must be OMITTED, not defaulted (no cross-caller memory bleed)");
 
   // caller audio → EL verbatim
   ws.send(JSON.stringify({ type: "audio.frame", seq: 1, timestampMs: 20, payloadBase64: "UENNMTZL" }));
@@ -222,6 +225,29 @@ test("full relay: init, audio both ways, barge-in ghosts, ping/pong, context, go
   fakeAgent.emit({ type: "client_tool_call", client_tool_call: { tool_name: "teleport", tool_call_id: "t3" } });
   await until(() => fakeAgent.sent.find((m) => m.type === "client_tool_result" && m.tool_call_id === "t3" && m.is_error === true));
 
+  // SSRF: show_image with a metadata/loopback URL → tool error, nothing displayed
+  fakeAgent.emit({
+    type: "client_tool_call",
+    client_tool_call: { tool_name: "show_image", tool_call_id: "t4", parameters: { url: "http://169.254.169.254/latest/meta-data/" } },
+  });
+  const ssrfResult = await until(() => fakeAgent.sent.find((m) => m.tool_call_id === "t4"));
+  assert.equal(ssrfResult.is_error, true);
+  assert.match(String(ssrfResult.result), /private/);
+  fakeAgent.emit({
+    type: "client_tool_call",
+    client_tool_call: { tool_name: "show_image", tool_call_id: "t5", parameters: { url: "http://127.0.0.1:8080/secret.png" } },
+  });
+  await until(() => fakeAgent.sent.find((m) => m.tool_call_id === "t5" && m.is_error === true));
+
+  // malformed EL frames (missing nested events) are dropped without killing the call
+  fakeAgent.emit({ type: "audio" } as never);
+  fakeAgent.emit({ type: "interruption" } as never);
+  fakeAgent.emit({ type: "ping" } as never);
+  fakeAgent.emit({ type: "client_tool_call" } as never);
+  const alivePongP = nextMessage(ws);
+  ws.send(JSON.stringify({ type: "ping", ts: 999 }));
+  assert.deepEqual(await alivePongP, { type: "pong", ts: 999 }, "call must survive malformed EL frames");
+
   // look with no video shared → tool error
   fakeAgent.emit({ type: "client_tool_call", client_tool_call: { tool_name: "look", tool_call_id: "v1", parameters: {} } });
   await until(() => fakeAgent.sent.find((m) => m.tool_call_id === "v1" && m.is_error === true && String(m.result).includes("no video")));
@@ -281,9 +307,78 @@ test("bridge-side governor: time limit → goodbye → session.end to worker", a
   await until(() => fakeAgentC.sent.find((m) => m.type === "user_message" && String(m.text).includes("Time limit reached")));
   const end = await until(() => received.find((m) => m.type === "session.end"));
   assert.equal(end.reason, "time-limit");
+  // playback must be flushed BEFORE the goodbye so buffered agent audio can't delay it
+  const cancelIdx = received.findIndex((m) => m.type === "assistant.cancel");
+  const endIdx = received.findIndex((m) => m.type === "session.end");
+  assert.ok(cancelIdx >= 0 && cancelIdx < endIdx, "assistant.cancel must precede session.end");
   await until(() => (fakeAgentC.closed ? true : undefined));
   await until(() => (ws.readyState === WebSocket.CLOSED ? true : undefined));
   serverC.close();
+});
+
+test("EL socket close mid-call → session.end(agent-disconnected) to worker; user_id sent when aadId known", async () => {
+  const callId = "call-elclose-1";
+  const ts = Date.now();
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/voice/msteams/stream/${callId}`, {
+    headers: { "X-OpenClawTeamsBridge-Timestamp": String(ts), "X-OpenClawTeamsBridge-Signature": sign(cfg.workerSharedSecret, ts, callId) },
+  });
+  await new Promise<void>((r) => ws.once("open", () => r()));
+  const received: Array<Record<string, unknown>> = [];
+  ws.on("message", (d) => received.push(JSON.parse(d.toString())));
+
+  const sentBefore = fakeAgent.sent.length;
+  ws.send(JSON.stringify({ type: "session.start", callId, threadId: "t", caller: { aadId: "aad-123", displayName: "Alaa" } }));
+  const init = await until(() => fakeAgent.sent.slice(sentBefore).find((m) => m.type === "conversation_initiation_client_data"));
+  assert.equal(init.user_id, "aad-123");
+
+  fakeAgent.handlers.onClose(1006, "gone");
+  const end = await until(() => received.find((m) => m.type === "session.end"));
+  assert.equal(end.reason, "agent-disconnected");
+  await until(() => (ws.readyState === WebSocket.CLOSED ? true : undefined));
+});
+
+test("deterministic goodbye: assistant.say with EL_TTS_VOICE_ID → exact TTS audio to worker", async () => {
+  const fakeAgentD = new FakeAgent();
+  const connectElD = async (_c: BridgeConfig, _l: unknown, handlers: ElSessionHandlers): Promise<AgentPort> => {
+    fakeAgentD.handlers = handlers;
+    return fakeAgentD;
+  };
+  const serverD = startServer({ ...cfg, elTtsVoiceId: "voice_x" }, connectElD, null);
+  await new Promise<void>((r) => serverD.once("listening", () => r()));
+  const portD = (serverD.address() as AddressInfo).port;
+
+  // stub the standalone-TTS REST call: 640 bytes of PCM = 20ms
+  const pcm = Buffer.alloc(640, 7);
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    const u = String(input);
+    if (u.includes("/v1/text-to-speech/voice_x")) {
+      return new Response(new Uint8Array(pcm), { status: 200 });
+    }
+    throw new Error(`unexpected fetch in test: ${u}`);
+  }) as typeof fetch;
+
+  try {
+    const callId = "call-tts-1";
+    const ts = Date.now();
+    const ws = new WebSocket(`ws://127.0.0.1:${portD}/voice/msteams/stream/${callId}`, {
+      headers: { "X-OpenClawTeamsBridge-Timestamp": String(ts), "X-OpenClawTeamsBridge-Signature": sign(cfg.workerSharedSecret, ts, callId) },
+    });
+    await new Promise<void>((r) => ws.once("open", () => r()));
+    const received: Array<Record<string, unknown>> = [];
+    ws.on("message", (d) => received.push(JSON.parse(d.toString())));
+    ws.send(JSON.stringify({ type: "session.start", callId, threadId: "t", caller: {} }));
+    await until(() => fakeAgentD.sent.find((m) => m.type === "conversation_initiation_client_data"));
+
+    ws.send(JSON.stringify({ type: "assistant.say", text: "Goodbye now." }));
+    const frame = await until(() => received.find((m) => m.type === "audio.frame"));
+    assert.equal(frame.payloadBase64, pcm.toString("base64"), "exact synthesized PCM must reach the worker");
+    assert.equal(fakeAgentD.sent.some((m) => m.type === "user_message"), false, "no agent fallback when TTS succeeds");
+    ws.close();
+  } finally {
+    globalThis.fetch = realFetch;
+    serverD.close();
+  }
 });
 
 test("look uses vision path 2 (describe) when a vision endpoint is configured — no upload, no gate", async () => {

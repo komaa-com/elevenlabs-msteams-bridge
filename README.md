@@ -66,7 +66,9 @@ See `.env.example`. Notable:
 - `EL_HOST` — pin the ElevenLabs region (`api.us.elevenlabs.io`, `api.eu.residency.elevenlabs.io`, `api.in.residency.elevenlabs.io`, `api.sg.residency.elevenlabs.io`) to match MediaNode locality and data-residency requirements.
 - `EL_TTS_VOICE_ID` — enables the deterministic governor goodbye (exact text via standalone TTS). Without it, the goodbye is delegated to the agent via `user_message`.
 - The agent's audio in/out format **must** be `pcm_16000` (agent settings); the bridge logs an error at call start if the conversation metadata reports anything else.
-- `conversation_config_override` fields (first message, prompt, voice) are rejected by ElevenLabs unless allowlisted in the agent's security settings.
+- `conversation_config_override` fields (first message, prompt, voice) are rejected by ElevenLabs unless allowlisted in the agent's security settings. `EL_FIRST_MESSAGE` uses this for a localized greeting / spoken disclosure.
+- Per-caller memory: the caller's AAD id is sent as `user_id` when Teams provides one; guests/anonymous callers get **no** `user_id` (never a shared default) so distinct callers can't bleed into one ElevenLabs memory.
+- `show_image` URLs supplied by the agent are SSRF-guarded: public http(s) hosts only, every resolved address checked against private/loopback/link-local/metadata ranges, no redirects, 10s timeout, 5 MB cap.
 
 ## Vision (`look` client tool)
 
