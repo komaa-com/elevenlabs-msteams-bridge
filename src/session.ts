@@ -497,6 +497,12 @@ export class CallSession {
         : "Describe what is visible.";
     try {
       if (this.vision) {
+        // Path 2 is INTENTIONALLY NOT recording-gated (owner decision 2026-07-10).
+        // The raw frame never leaves the bridge — only a text description does —
+        // but note that description becomes ElevenLabs conversation content, which
+        // EL persists by default. Operators who need "no vision until recording is
+        // on" should enable EL zero-retention or use recording-gated path 1. See
+        // "Vision and recording" in the README.
         const description = await this.vision(frame, question);
         this.el?.sendClientToolResult(toolCallId, description, false);
         return;

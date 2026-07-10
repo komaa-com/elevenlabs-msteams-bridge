@@ -74,8 +74,8 @@ See `.env.example`. Notable:
 
 Define a client tool named `look` on the agent (parameters: optional `source` = `camera`|`screenshare`, optional `question`). When the agent calls it, the bridge grabs the latest buffered frame and answers one of two ways:
 
-1. **Path 2 (preferred, if `VISION_API_URL`/`VISION_MODEL` are set):** the frame goes to your OpenAI-compatible vision endpoint and the description comes back as the tool result. Transient processing, nothing persisted, works regardless of recording state.
-2. **Path 1 (fallback):** the frame is uploaded to the live ElevenLabs conversation and injected as a `multimodal_message` (the agent's LLM must be multimodal). Because this **persists** the frame with a third party, it is refused unless Teams recording is `active`.
+1. **Path 2 (preferred, if `VISION_API_URL`/`VISION_MODEL` are set):** the frame goes to your OpenAI-compatible vision endpoint and the description comes back as the tool result. The **raw frame never leaves the bridge** (only the text description does), and it works **regardless of recording state**. Note the data flow, though: the description becomes ElevenLabs conversation content, which ElevenLabs **persists by default** — so a description of the caller's screen/camera can be stored by a third party even when Teams recording is off. This is a deliberate choice (vision stays usable without recording). If your deployment needs "no vision until recording is on," enable ElevenLabs zero-retention on the agent, or leave `VISION_API_URL` unset so only the recording-gated path 1 is available.
+2. **Path 1 (fallback):** the frame is uploaded to the live ElevenLabs conversation and injected as a `multimodal_message` (the agent's LLM must be multimodal). Because this **persists the raw frame** with a third party, it is refused unless Teams recording is `active`.
 
 The other client tools the bridge maps: `end_call`, `express` (`{emotion}`), `show_image` (`{dataBase64, mime}` or `{url}`, jpeg/png).
 
@@ -89,6 +89,8 @@ Two governors can end a call gracefully; both speak before hanging up:
 ## Privacy / recording gate
 
 The worker reports Teams recording state (`recording.status`). The bridge never logs or persists transcripts unless `LOG_TRANSCRIPTS=true` **and** recording is `active` (Media Access API requirement). Video frames are buffered in memory only and dropped at teardown.
+
+**Vision and recording (know the trade-off):** the recording gate blocks path-1 frame **uploads** to ElevenLabs when recording is off, but path-2 vision descriptions (see above) are ungated by design. In both cases caller audio and any vision descriptions transit ElevenLabs' cloud and are retained per the agent's retention settings. For deployments that must not retain caller data with a third party, enable ElevenLabs zero-retention on the agent and disclose in a spoken `EL_FIRST_MESSAGE` that an AI is on the call.
 
 ## Layout
 
