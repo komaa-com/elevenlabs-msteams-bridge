@@ -74,8 +74,7 @@ export interface ConversationInitOptions {
   /**
    * Stable per-person id for ElevenLabs analytics/memory. Pass the caller's
    * AAD id when present; NEVER a shared default — distinct anonymous callers
-   * must not collide on one id (cross-caller memory bleed, see Protocol.cs
-   * CallerInfo). Omitted when null.
+   * must not collide on one id (cross-caller memory bleed). Omitted when null.
    */
   userId?: string | null;
   /** Pin a specific agent branch (per-tenant variants). Omitted when null. */
@@ -251,12 +250,19 @@ export class ElAgentSocket implements AgentPort {
         if (meta?.conversation_id) {
           sock.conversationId = meta.conversation_id;
         }
-        // pcm_16000 both ways is the no-transcode contract (spec §4); anything else is an agent misconfig.
-        if (meta?.agent_output_audio_format && meta.agent_output_audio_format !== "pcm_16000") {
-          log.error(`agent_output_audio_format is ${meta.agent_output_audio_format}, expected pcm_16000 — fix the agent's audio settings`);
-        }
-        if (meta?.user_input_audio_format && meta.user_input_audio_format !== "pcm_16000") {
-          log.error(`user_input_audio_format is ${meta.user_input_audio_format}, expected pcm_16000 — fix the agent's audio settings`);
+        // pcm_16000 both ways is the no-transcode contract (spec §4); anything else is an agent
+        // misconfig. Log-only used to leave the call "up" with garbled/dead audio for its whole
+        // duration — close the agent socket instead so the session tears the call down cleanly
+        // and the operator sees one unambiguous error (review LOW: format mismatch is fatal).
+        const badFormat =
+          (meta?.agent_output_audio_format && meta.agent_output_audio_format !== "pcm_16000" && meta.agent_output_audio_format) ||
+          (meta?.user_input_audio_format && meta.user_input_audio_format !== "pcm_16000" && meta.user_input_audio_format);
+        if (badFormat) {
+          log.error(
+            `agent audio format is ${badFormat}, expected pcm_16000 both ways — fix the agent's audio settings; ending the call`,
+          );
+          sock.close();
+          return;
         }
       }
       try {
