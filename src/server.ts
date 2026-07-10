@@ -10,8 +10,8 @@ import { makeVisionDescriber, type VisionDescriber } from "./vision.js";
 const log = logger("server");
 
 /**
- * Worker-facing WebSocket server. The MediaNode dials
- * {OpenClawWsBaseUrl}/{callId} with an HMAC-signed upgrade
+ * Worker-facing WebSocket server. The StandIn media bridge dials
+ * {wsBaseUrl}/{callId} with an HMAC-signed upgrade
  * (X-OpenClawTeamsBridge-Timestamp / -Signature over "{timestampMs}.{callId}");
  * the bridge validates exactly like the OpenClaw provider does (spec §6).
  */
