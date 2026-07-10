@@ -268,10 +268,24 @@ export class ElAgentSocket implements AgentPort {
   private static async openOnce(cfg: BridgeConfig): Promise<WebSocket> {
     const signedUrl = await getSignedUrl(cfg);
     const ws = new WebSocket(signedUrl);
-    await new Promise<void>((resolve, reject) => {
-      ws.once("open", () => resolve());
-      ws.once("error", (err) => reject(err));
-    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        ws.once("open", () => resolve());
+        ws.once("error", (err) => reject(err));
+      });
+    } catch (err) {
+      // The rejected socket is now orphaned. Without a permanent 'error' listener
+      // a later error event (TCP reset on the half-open socket) is an uncaught
+      // EventEmitter 'error' → the whole process (all live calls) crashes.
+      // Neutralize it before discarding: swallow errors, then terminate.
+      ws.on("error", () => {});
+      try {
+        ws.terminate();
+      } catch {
+        /* already dead */
+      }
+      throw err;
+    }
     return ws;
   }
 
