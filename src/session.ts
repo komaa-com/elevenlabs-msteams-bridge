@@ -41,6 +41,10 @@ const MAX_PENDING_CONTEXT = 32;
  *  call, so a hung TTS synth can never wedge a time-limited call open (H3). */
 const GOODBYE_HARD_CAP_MS = 8_000;
 
+/** Min gap between "now speaking" contextual updates (group calls), so VAD
+ *  flapping between speakers cannot spam the agent. */
+const SPEAKER_UPDATE_MIN_INTERVAL_MS = 5_000;
+
 /** Injectable EL connector so tests can substitute a fake agent. */
 export type ElConnector = (cfg: BridgeConfig, log: Logger, handlers: ElSessionHandlers) => Promise<AgentPort>;
 
@@ -74,6 +78,12 @@ export class CallSession {
   // hard mute: set ONLY while a deterministic TTS goodbye plays (never for the
   // user_message fallback, where the agent itself must stay audible)
   private muteAgentAudio = false;
+  // first goodbye wins: both governors (worker assistant.say + bridge time limit) can race
+  private goodbyeInProgress = false;
+  // group-call speaker attribution: last name surfaced + a rate limit so VAD flapping can't spam
+  private lastSpeakerName: string | null = null;
+  private lastSpeakerUpdateMs = 0;
+  private participantCount = 1;
   // caller audio arriving while the EL socket is still connecting (session.start → open)
   private pendingAudio: string[] = [];
   private sessionStarted = false;
@@ -145,6 +155,7 @@ export class CallSession {
         // first words; flushed right after conversation init.
         if (this.el) {
           this.el.sendAudioChunk(msg.payloadBase64);
+          this.noteSpeaker(msg.speakerName);
         } else if (this.sessionStarted) {
           this.pendingAudio.push(msg.payloadBase64);
           if (this.pendingAudio.length > MAX_PENDING_AUDIO_FRAMES) {
@@ -156,6 +167,7 @@ export class CallSession {
         this.sendToWorker({ type: "pong", ts: msg.ts });
         break;
       case "participants":
+        this.participantCount = msg.count;
         this.pushContext(
           msg.count <= 1
             ? "This is a 1:1 call with a single human caller."
@@ -170,7 +182,13 @@ export class CallSession {
         this.log.info(`recording.status = ${msg.status}`);
         break;
       case "video.frame":
-        this.latestVideoFrame.set(msg.source, msg); // buffered for on-demand vision (§5); not persisted
+        // Known sources only (camera/screenshare): the key comes from the peer, so an
+        // unexpected value must not grow the map unbounded (review LOW).
+        if (msg.source === "camera" || msg.source === "screenshare") {
+          this.latestVideoFrame.set(msg.source, msg); // buffered for on-demand vision (§5); not persisted
+        } else {
+          this.log.debug(`ignoring video.frame with unknown source "${msg.source}"`);
+        }
         break;
       case "assistant.say":
         // worker-side governor (H4): speak, the worker tears down afterwards
@@ -196,7 +214,7 @@ export class CallSession {
     }
     this.sessionStarted = true;
     if (msg.callId && msg.callId !== this.callId) {
-      // must match the HMAC-authenticated callId in the URL path (Protocol.cs)
+      // must match the HMAC-authenticated callId in the URL path (wire contract)
       this.log.error(`session.start callId ${msg.callId} != URL callId ${this.callId}; closing`);
       this.teardown("callid-mismatch");
       return;
@@ -246,7 +264,7 @@ export class CallSession {
         environment: this.cfg.elEnvironment,
         firstMessage: this.cfg.elFirstMessage,
         // per-person memory: AAD id when known; omitted for guests/anonymous so
-        // distinct callers never share an identity (Protocol.cs CallerInfo note)
+        // distinct callers never share an identity (CallerInfo fields are nullable on the wire)
         userId: msg.caller?.aadId?.trim() || null,
         branchId: this.cfg.elAgentBranchId,
       }),
@@ -299,6 +317,26 @@ export class CallSession {
     }
     this.goodbyeTimer = setTimeout(() => this.endCall("time-limit"), graceMs + 500);
     this.goodbyeTimer.unref?.();
+  }
+
+  /**
+   * Group-call speaker attribution (review LOW / sibling parity): the worker tags
+   * audio.frame with the active speaker's display name. Surface it to the agent
+   * as a non-interrupting contextual update so it can reason about who said what.
+   * Only in group calls (1:1 attribution is noise), only when the name CHANGES,
+   * and rate-limited so VAD flapping between speakers cannot spam the agent.
+   */
+  private noteSpeaker(name: string | null | undefined): void {
+    if (!name || this.participantCount <= 1) {
+      return;
+    }
+    const now = Date.now();
+    if (name === this.lastSpeakerName || now - this.lastSpeakerUpdateMs < SPEAKER_UPDATE_MIN_INTERVAL_MS) {
+      return;
+    }
+    this.lastSpeakerName = name;
+    this.lastSpeakerUpdateMs = now;
+    this.el?.sendContextualUpdate(`The person now speaking is ${name}.`);
   }
 
   /**
@@ -549,6 +587,14 @@ export class CallSession {
    * relaying (mute stays off), duration unknown (null).
    */
   private async performGoodbye(text: string): Promise<number | null> {
+    // Both governors can race (worker assistant.say + bridge time limit). Running
+    // performGoodbye twice would double-speak and leave the mute latch in an
+    // ambiguous state (review LOW: double-goodbye) — first one wins.
+    if (this.goodbyeInProgress) {
+      this.log.info("goodbye already in progress; ignoring duplicate");
+      return null;
+    }
+    this.goodbyeInProgress = true;
     this.log.info("speaking goodbye");
     this.sendToWorker({ type: "assistant.cancel", turnId: 0 });
     this.lastInterruptEventId = Math.max(this.lastInterruptEventId, this.lastSeenAudioEventId);
