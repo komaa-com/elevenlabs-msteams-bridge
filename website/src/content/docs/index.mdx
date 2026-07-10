@@ -1,0 +1,38 @@
+---
+title: "Microsoft Teams Bridge for ElevenLabs Agents"
+description: "Put an ElevenLabs Agent on a real Microsoft Teams call through the StandIn media bridge: verbatim PCM16k relay, barge-in, vision on demand, call governors."
+---
+
+Welcome! **`@komaa/elevenlabs-msteams-bridge`** (npm: [`@komaa/elevenlabs-msteams-bridge`](https://www.npmjs.com/package/@komaa/elevenlabs-msteams-bridge)) puts an [ElevenLabs Agent](https://elevenlabs.io/docs/eleven-agents/api-reference/eleven-agents/websocket) on a real **Microsoft Teams call**.
+
+It is a small Node.js service (and importable TypeScript library) that sits between two WebSockets:
+
+```text
+Microsoft Teams ⇄ StandIn media bridge ──HMAC WS──▶ this bridge ──WS──▶ ElevenLabs Agent
+      (call)          (hosted service)                 (yours)          (STT+LLM+TTS+VAD)
+```
+
+The hosted **StandIn media bridge** ([standin.komaa.com](https://standin.komaa.com)) joins the Teams call and dials into your bridge, one authenticated WebSocket per call. The bridge opens one ElevenLabs Agent conversation per call and relays between them. Both sides speak base64 **PCM 16 kHz mono**, so audio is copied **verbatim** in both directions: no resampling, no re-encoding, nothing added to the latency budget beyond a relay hop.
+
+## What it does
+
+- **Realtime voice** - the caller talks to your ElevenLabs agent and hears it reply. Turn-taking, VAD and interruption are the agent's own; the bridge maps the caller's barge-in onto the Teams side and drops stale "ghost" audio so nothing plays after an interruption.
+- **Per-call personalization** - caller name, tenant and direction as `dynamic_variables`; optional localized greeting or spoken AI disclosure; per-caller memory via `user_id` (guests never share an identity).
+- **Vision on demand** - the agent's `look` client tool sees the caller's camera or screen-share: your own vision model (path 2) or ElevenLabs multimodal upload (path 1, recording-gated).
+- **Agent client tools** - `end_call`, `express` (avatar emotion), `show_image` (image on the bot's tile, SSRF-guarded), `look`.
+- **Two call governors** - StandIn-side tier cutoffs get a spoken goodbye; a bridge-side `MAX_CALL_MINUTES` hard cap protects your ElevenLabs budget.
+- **Hardened transport** - replay-proof HMAC handshake, connection and payload caps, duplicate-call rejection, graceful SIGTERM drain, and an ElevenLabs host allowlist so your API key can never be sent elsewhere.
+
+## Where to go next
+
+- [Getting Started](/elevenlabs-msteams-bridge/getting-started/) - install, configure, first call.
+- [Connecting to StandIn](/elevenlabs-msteams-bridge/connecting-to-standin/) - the tiers, the shared secret, pointing an identity at the bridge.
+- [Architecture](/elevenlabs-msteams-bridge/architecture/) - how a call flows, module map, the trust model.
+- [Configuration Reference](/elevenlabs-msteams-bridge/configuration-reference/) - every environment variable.
+- [Library API](/elevenlabs-msteams-bridge/library-api/) - embed the bridge in your own Node project.
+- [Wire Protocol](/elevenlabs-msteams-bridge/wire-protocol/) - the exact contract on both sockets.
+- [Vision and Tools](/elevenlabs-msteams-bridge/vision-and-tools/) - the `look` tool, client tools, the data-flow trade-offs.
+- [Governors and Privacy](/elevenlabs-msteams-bridge/governors-and-privacy/) - goodbyes, recording gate, retention.
+- [Troubleshooting](/elevenlabs-msteams-bridge/troubleshooting/) - the errors you will actually see, and what they mean.
+
+There is also a runnable [example project](https://github.com/komaa-com/elevenlabs-msteams-bridge/tree/main/examples/basic-bridge) in the repository.
