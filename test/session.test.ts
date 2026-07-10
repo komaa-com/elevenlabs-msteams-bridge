@@ -177,6 +177,29 @@ test("full relay: init, audio both ways, barge-in ghosts, ping/pong, context, go
   ws.send(JSON.stringify({ type: "dtmf", digit: "7" }));
   await until(() => fakeAgent.sent.find((m) => m.type === "contextual_update" && String(m.text).includes('"7"')));
 
+  // client tool: express → expression to worker + tool result to agent
+  const exprP = nextMessage(ws);
+  fakeAgent.emit({ type: "client_tool_call", client_tool_call: { tool_name: "express", tool_call_id: "t1", parameters: { emotion: "happy" } } });
+  const expr = await exprP;
+  assert.deepEqual(expr, { type: "expression", emotion: "happy" });
+  await until(() => fakeAgent.sent.find((m) => m.type === "client_tool_result" && m.tool_call_id === "t1" && m.is_error === false));
+
+  // client tool: show_image (inline base64) → display.image to worker
+  const imgP = nextMessage(ws);
+  fakeAgent.emit({
+    type: "client_tool_call",
+    client_tool_call: { tool_name: "show_image", tool_call_id: "t2", parameters: { dataBase64: "aW1n", mime: "image/png", caption: "chart" } },
+  });
+  const img = await imgP;
+  assert.equal(img.type, "display.image");
+  assert.equal(img.mime, "image/png");
+  assert.equal(img.caption, "chart");
+  await until(() => fakeAgent.sent.find((m) => m.type === "client_tool_result" && m.tool_call_id === "t2" && m.is_error === false));
+
+  // client tool: unknown → tool error, call keeps running
+  fakeAgent.emit({ type: "client_tool_call", client_tool_call: { tool_name: "teleport", tool_call_id: "t3" } });
+  await until(() => fakeAgent.sent.find((m) => m.type === "client_tool_result" && m.tool_call_id === "t3" && m.is_error === true));
+
   // governor goodbye without a TTS voice → user_message fallback
   ws.send(JSON.stringify({ type: "assistant.say", text: "Goodbye, thanks for calling." }));
   await until(() => fakeAgent.sent.find((m) => m.type === "user_message" && String(m.text).includes("Goodbye")));
