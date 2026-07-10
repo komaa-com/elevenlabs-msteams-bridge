@@ -45,8 +45,34 @@ export interface BridgeConfig {
   goodbyeGraceMs: number;
   /** Allowed clock skew for the HMAC timestamp, in ms (worker side documents ±60s). */
   hmacFreshnessMs: number;
+  /** Max concurrent worker connections (0 = default 64). */
+  maxConnections: number;
+  /** Max concurrent connections from one remote IP (0 = default 8). */
+  maxConnectionsPerIp: number;
+  /** Drop a worker that authenticates but never sends session.start after this many ms (0 = default 10s). */
+  preStartTimeoutMs: number;
   /** Log EL transcripts (still gated on Teams recording.status === "active", spec §7). */
   logTranscripts: boolean;
+}
+
+/**
+ * ELEVENLABS_API_KEY is sent as `xi-api-key` to `https://{EL_HOST}/...`, so an
+ * attacker-influenced or fat-fingered EL_HOST would exfiltrate the key. Restrict
+ * it to ElevenLabs' own hosts (the default + the documented regional pins). Set
+ * EL_HOST_ALLOW_ANY=true only for a deliberate proxy/test host.
+ */
+function validateElHost(host: string): string {
+  if (process.env.EL_HOST_ALLOW_ANY === "true") {
+    return host;
+  }
+  const h = host.toLowerCase();
+  if (h === "elevenlabs.io" || h.endsWith(".elevenlabs.io")) {
+    return host;
+  }
+  throw new Error(
+    `EL_HOST "${host}" is not an elevenlabs.io host; the API key must not be sent elsewhere. ` +
+      `Set EL_HOST_ALLOW_ANY=true to override for a trusted proxy.`,
+  );
 }
 
 function required(name: string): string {
@@ -69,7 +95,7 @@ export function loadConfig(): BridgeConfig {
     workerSharedSecret: required("WORKER_SHARED_SECRET"),
     elevenLabsApiKey: required("ELEVENLABS_API_KEY"),
     elevenLabsAgentId: required("ELEVENLABS_AGENT_ID"),
-    elHost: process.env.EL_HOST ?? "api.elevenlabs.io",
+    elHost: validateElHost(process.env.EL_HOST?.trim() || "api.elevenlabs.io"),
     elEnvironment: optional("EL_ENVIRONMENT"),
     elFirstMessage: optional("EL_FIRST_MESSAGE"),
     elAgentBranchId: optional("EL_AGENT_BRANCH_ID"),
@@ -84,6 +110,9 @@ export function loadConfig(): BridgeConfig {
     visionApiKey: optional("VISION_API_KEY"),
     visionModel: optional("VISION_MODEL"),
     hmacFreshnessMs: Number(process.env.HMAC_FRESHNESS_MS ?? 60_000),
+    maxConnections: Number(process.env.MAX_CONNECTIONS ?? 0),
+    maxConnectionsPerIp: Number(process.env.MAX_CONNECTIONS_PER_IP ?? 0),
+    preStartTimeoutMs: Number(process.env.PRE_START_TIMEOUT_MS ?? 0),
     logTranscripts: process.env.LOG_TRANSCRIPTS === "true",
   };
 }
