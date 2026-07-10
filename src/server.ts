@@ -4,6 +4,7 @@ import type { BridgeConfig } from "./config.js";
 import { isFresh, verify, SIGNATURE_HEADER, TIMESTAMP_HEADER } from "./hmac.js";
 import { logger } from "./log.js";
 import { CallSession, type ElConnector } from "./session.js";
+import { makeVisionDescriber, type VisionDescriber } from "./vision.js";
 
 const log = logger("server");
 
@@ -42,7 +43,11 @@ export function authorizeUpgrade(cfg: BridgeConfig, req: IncomingMessage): { cal
   return { callId };
 }
 
-export function startServer(cfg: BridgeConfig, connectEl?: ElConnector): ReturnType<typeof createServer> {
+export function startServer(
+  cfg: BridgeConfig,
+  connectEl?: ElConnector,
+  vision?: VisionDescriber | null,
+): ReturnType<typeof createServer> {
   const httpServer = createServer((req, res) => {
     if (req.url === "/healthz") {
       res.writeHead(200, { "content-type": "text/plain" });
@@ -65,7 +70,7 @@ export function startServer(cfg: BridgeConfig, connectEl?: ElConnector): ReturnT
     }
     wss.handleUpgrade(req, socket, head, (ws) => {
       log.info(`worker connected for call ${auth.callId.slice(0, 12)}…`);
-      new CallSession(cfg, ws, auth.callId, connectEl);
+      new CallSession(cfg, ws, auth.callId, connectEl, vision === undefined ? makeVisionDescriber(cfg) : vision);
     });
   });
 
