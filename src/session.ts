@@ -22,10 +22,13 @@ import {
   type ElSessionHandlers,
 } from "./elevenlabs.js";
 import { makeVisionDescriber, type VisionDescriber } from "./vision.js";
-import { assertPublicHttpUrl } from "./ssrf.js";
+import { assertPublicHttpUrl, readBodyWithCap } from "./ssrf.js";
 
 /** show_image fetch cap: display.image goes to a 640×360 tile; 5 MB is generous. */
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+
+/** Pending caller-audio cap while EL connects: 250 × 20 ms = 5 s. */
+const MAX_PENDING_AUDIO_FRAMES = 250;
 
 /** Injectable EL connector so tests can substitute a fake agent. */
 export type ElConnector = (cfg: BridgeConfig, log: Logger, handlers: ElSessionHandlers) => Promise<AgentPort>;
@@ -55,6 +58,14 @@ export class CallSession {
 
   // barge-in ghost filter: drop EL audio with event_id <= the last interruption (spec §4)
   private lastInterruptEventId = -1;
+  // highest event_id relayed so far — the flush point for goodbye ghost-dropping
+  private lastSeenAudioEventId = 0;
+  // hard mute: set ONLY while a deterministic TTS goodbye plays (never for the
+  // user_message fallback, where the agent itself must stay audible)
+  private muteAgentAudio = false;
+  // caller audio arriving while the EL socket is still connecting (session.start → open)
+  private pendingAudio: string[] = [];
+  private sessionStarted = false;
 
   // Teams recording gate (spec §7): transcripts may be logged/persisted only when "active"
   private recordingActive = false;
@@ -79,7 +90,15 @@ export class CallSession {
     this.connectEl = connectEl;
     this.vision = vision;
 
-    worker.on("message", (data) => this.onWorkerMessage(data as Buffer));
+    worker.on("message", (data) => {
+      // parity with the EL side: a handler throw must not escape the ws
+      // listener (uncaught exception → process down)
+      try {
+        this.onWorkerMessage(data as Buffer);
+      } catch (err) {
+        this.log.error(`error handling worker message: ${(err as Error).message}`);
+      }
+    });
     worker.on("close", () => this.teardown("worker-closed"));
     worker.on("error", (err) => {
       this.log.warn(`worker socket error: ${(err as Error).message}`);
@@ -100,8 +119,17 @@ export class CallSession {
         void this.onSessionStart(msg);
         break;
       case "audio.frame":
-        // hot path: caller audio → agent, verbatim
-        this.el?.sendAudioChunk(msg.payloadBase64);
+        // hot path: caller audio → agent, verbatim. While the EL socket is
+        // still connecting, buffer (bounded) instead of dropping the caller's
+        // first words; flushed right after conversation init.
+        if (this.el) {
+          this.el.sendAudioChunk(msg.payloadBase64);
+        } else if (this.sessionStarted) {
+          this.pendingAudio.push(msg.payloadBase64);
+          if (this.pendingAudio.length > MAX_PENDING_AUDIO_FRAMES) {
+            this.pendingAudio.shift(); // keep the most recent speech
+          }
+        }
         break;
       case "ping":
         this.sendToWorker({ type: "pong", ts: msg.ts });
@@ -125,7 +153,7 @@ export class CallSession {
         break;
       case "assistant.say":
         // worker-side governor (H4): speak, the worker tears down afterwards
-        void this.speakGoodbye(msg.text);
+        void this.performGoodbye(msg.text);
         break;
       case "session.end":
         this.log.info(`session.end from worker: ${msg.reason}`);
@@ -137,6 +165,13 @@ export class CallSession {
   }
 
   private async onSessionStart(msg: SessionStartMessage): Promise<void> {
+    if (this.sessionStarted) {
+      // A second session.start would orphan the first EL socket; the worker
+      // sends exactly one per connection, so treat a repeat as a protocol error.
+      this.log.warn("duplicate session.start ignored");
+      return;
+    }
+    this.sessionStarted = true;
     if (msg.callId && msg.callId !== this.callId) {
       // must match the HMAC-authenticated callId in the URL path (Protocol.cs)
       this.log.error(`session.start callId ${msg.callId} != URL callId ${this.callId}; closing`);
@@ -177,6 +212,11 @@ export class CallSession {
         branchId: this.cfg.elAgentBranchId,
       }),
     );
+    // flush caller audio buffered while the socket was connecting
+    for (const chunk of this.pendingAudio) {
+      this.el.sendAudioChunk(chunk);
+    }
+    this.pendingAudio = [];
     this.log.info("ElevenLabs agent session open; relaying");
 
     // Bridge-side governor (spec §9): ElevenLabs doesn't know about your billing.
@@ -193,12 +233,7 @@ export class CallSession {
       return;
     }
     this.log.info("governor: call time limit reached");
-    // Flush first: the worker may still have buffered agent audio that would
-    // otherwise delay the goodbye past the grace window. Also stop relaying any
-    // further agent audio so the agent can't talk over the goodbye.
-    this.lastInterruptEventId = Number.MAX_SAFE_INTEGER;
-    this.sendToWorker({ type: "assistant.cancel", turnId: 0 });
-    const playedMs = await this.speakGoodbye(this.cfg.goodbyeText);
+    const playedMs = await this.performGoodbye(this.cfg.goodbyeText);
     // deterministic TTS reports its real duration; the agent-side fallback doesn't
     const graceMs = playedMs ?? this.cfg.goodbyeGraceMs;
     setTimeout(() => this.endCall("time-limit"), graceMs + 500);
@@ -215,6 +250,11 @@ export class CallSession {
         const ev = (msg as ElAudioEvent).audio_event;
         if (!ev || typeof ev.event_id !== "number" || typeof ev.audio_base_64 !== "string") {
           this.log.warn("EL audio frame missing audio_event/event_id/audio_base_64; dropping");
+          return;
+        }
+        this.lastSeenAudioEventId = Math.max(this.lastSeenAudioEventId, ev.event_id);
+        if (this.muteAgentAudio) {
+          this.log.debug(`dropping agent audio ${ev.event_id} (deterministic goodbye playing)`);
           return;
         }
         if (ev.event_id <= this.lastInterruptEventId) {
@@ -323,10 +363,7 @@ export class CallSession {
           throw new Error(`fetch ${url} → HTTP ${res.status}`);
         }
         mime = res.headers.get("content-type")?.split(";")[0] ?? "image/jpeg";
-        const body = Buffer.from(await res.arrayBuffer());
-        if (body.length > MAX_IMAGE_BYTES) {
-          throw new Error(`image too large (${body.length} bytes, max ${MAX_IMAGE_BYTES})`);
-        }
+        const body = await readBodyWithCap(res, MAX_IMAGE_BYTES); // streams; rejects before buffering an oversized body
         dataBase64 = body.toString("base64");
       }
       if (!dataBase64 || !mime || !/^image\/(jpeg|png)$/.test(mime)) {
@@ -413,18 +450,28 @@ export class CallSession {
   // ---- governor goodbye (spec §2 assistant.say) ----
 
   /**
-   * Speak a goodbye line. Preferred: deterministic, the exact text via
-   * standalone TTS (returns the real audio duration in ms). Fallback: ask the
-   * agent itself via user_message (returns null, duration unknown).
+   * Speak a goodbye line (both governors: worker assistant.say and the
+   * bridge-side time limit). Flushes buffered playback first (assistant.cancel
+   * + drop in-flight ghosts up to the last seen event_id) so stale agent audio
+   * cannot delay the goodbye.
+   *
+   * Preferred: deterministic, the exact text via standalone TTS — the agent is
+   * hard-muted while it plays and the real duration (ms) is returned.
+   * Fallback: the agent itself says it via user_message — its audio MUST keep
+   * relaying (mute stays off), duration unknown (null).
    */
-  private async speakGoodbye(text: string): Promise<number | null> {
+  private async performGoodbye(text: string): Promise<number | null> {
     this.log.info("speaking goodbye");
+    this.sendToWorker({ type: "assistant.cancel", turnId: 0 });
+    this.lastInterruptEventId = Math.max(this.lastInterruptEventId, this.lastSeenAudioEventId);
     if (this.cfg.elTtsVoiceId) {
       try {
+        this.muteAgentAudio = true; // only the deterministic goodbye may speak now
         const pcm = await synthesizeGoodbye(this.cfg, text);
         this.emitAudioToWorker(pcm.toString("base64"));
         return pcm16kBytesToMs(pcm.length);
       } catch (err) {
+        this.muteAgentAudio = false; // fallback: the agent must stay audible
         this.log.warn(`goodbye TTS failed (${(err as Error).message}); falling back to user_message`);
       }
     }

@@ -1,6 +1,6 @@
 {
   "name": "@komaa/elevenlabs-msteams-bridge",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Bridge Microsoft Teams voice/video calls to an ElevenLabs Agent. Terminates the OpenClawBridge worker wire protocol on one side and the ElevenLabs Agent WebSocket on the other.",
   "keywords": [
     "elevenlabs",

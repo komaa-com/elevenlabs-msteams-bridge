@@ -84,7 +84,7 @@ The other client tools the bridge maps: `end_call`, `express` (`{emotion}`), `sh
 Two governors can end a call gracefully; both speak before hanging up:
 
 - **Worker-side** (existing H4 behavior): the MediaNode sends `assistant.say` with the goodbye text; the bridge speaks it (exact text via standalone TTS when `EL_TTS_VOICE_ID` is set, otherwise the agent is asked to say it) and the worker tears the call down.
-- **Bridge-side** (`MAX_CALL_MINUTES` > 0): the bridge arms a timer at `session.start`. On expiry it speaks `GOODBYE_TEXT`, waits for the audio to play out (real TTS duration, or `GOODBYE_GRACE_MS` when unknown), then sends `session.end` with reason `time-limit`. Use this when the billing limit lives with the bridge operator, since ElevenLabs knows nothing about your budget.
+- **Bridge-side** (`MAX_CALL_MINUTES` > 0): the bridge arms a timer at `session.start`. On expiry it flushes playback, speaks `GOODBYE_TEXT`, waits for the audio to play out (real TTS duration, or `GOODBYE_GRACE_MS` when unknown), then sends `session.end` with reason `time-limit`. Use this when the billing limit lives with the bridge operator, since ElevenLabs knows nothing about your budget. (A cross-call daily budget is operator-side accounting on top of this per-call cap; the bridge does not track spend across calls.)
 
 ## Privacy / recording gate
 

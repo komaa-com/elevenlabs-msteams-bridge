@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { assertPublicHttpUrl, isForbiddenIp } from "../src/ssrf.js";
+import { assertPublicHttpUrl, isForbiddenIp, readBodyWithCap } from "../src/ssrf.js";
 
 test("forbidden addresses: loopback, RFC1918, link-local/metadata, CGNAT, v6 privates", () => {
   for (const ip of [
@@ -38,4 +38,15 @@ test("assertPublicHttpUrl checks every resolved address", async () => {
   const url = await assertPublicHttpUrl("https://example.com/cat.jpg", publicLookup);
   assert.equal(url.hostname, "example.com");
   await assert.rejects(() => assertPublicHttpUrl("https://example.com/cat.jpg", rebindLookup), /private/);
+});
+
+test("readBodyWithCap: content-length reject, streamed overrun reject, small body passes", async () => {
+  const big = new Uint8Array(1024);
+  await assert.rejects(
+    () => readBodyWithCap(new Response(big, { headers: { "content-length": "999999" } }), 512),
+    /too large/,
+  );
+  await assert.rejects(() => readBodyWithCap(new Response(big), 512), /exceeded|too large/);
+  const ok = await readBodyWithCap(new Response(new Uint8Array([1, 2, 3])), 512);
+  assert.deepEqual([...ok], [1, 2, 3]);
 });

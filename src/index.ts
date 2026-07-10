@@ -12,7 +12,7 @@ export { loadConfig, type BridgeConfig } from "./config.js";
 export { startServer, authorizeUpgrade, callIdFromUrl } from "./server.js";
 export { CallSession, type ElConnector } from "./session.js";
 export { makeVisionDescriber, type VisionDescriber } from "./vision.js";
-export { assertPublicHttpUrl, isForbiddenIp } from "./ssrf.js";
+export { assertPublicHttpUrl, isForbiddenIp, readBodyWithCap } from "./ssrf.js";
 export {
   ElAgentSocket,
   getSignedUrl,

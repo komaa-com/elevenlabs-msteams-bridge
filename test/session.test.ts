@@ -305,6 +305,10 @@ test("bridge-side governor: time limit → goodbye → session.end to worker", a
 
   // goodbye fallback fires at the limit, then session.end after the grace
   await until(() => fakeAgentC.sent.find((m) => m.type === "user_message" && String(m.text).includes("Time limit reached")));
+  // F1 regression: the agent's spoken goodbye (user_message fallback) must still
+  // relay — a blanket mute here would hang up in silence
+  fakeAgentC.emit({ type: "audio", audio_event: { audio_base_64: Buffer.alloc(640).toString("base64"), event_id: 1 } });
+  await until(() => received.find((m) => m.type === "audio.frame"));
   const end = await until(() => received.find((m) => m.type === "session.end"));
   assert.equal(end.reason, "time-limit");
   // playback must be flushed BEFORE the goodbye so buffered agent audio can't delay it
@@ -374,11 +378,55 @@ test("deterministic goodbye: assistant.say with EL_TTS_VOICE_ID → exact TTS au
     const frame = await until(() => received.find((m) => m.type === "audio.frame"));
     assert.equal(frame.payloadBase64, pcm.toString("base64"), "exact synthesized PCM must reach the worker");
     assert.equal(fakeAgentD.sent.some((m) => m.type === "user_message"), false, "no agent fallback when TTS succeeds");
+    // playback flushed before the goodbye, and the agent is muted while it plays
+    assert.ok(received.some((m) => m.type === "assistant.cancel"), "goodbye must flush playback first");
+    const framesBefore = received.filter((m) => m.type === "audio.frame").length;
+    fakeAgentD.emit({ type: "audio", audio_event: { audio_base_64: pcm.toString("base64"), event_id: 99 } });
+    await new Promise((r) => setTimeout(r, 60));
+    assert.equal(received.filter((m) => m.type === "audio.frame").length, framesBefore, "agent audio is muted during deterministic goodbye");
     ws.close();
   } finally {
     globalThis.fetch = realFetch;
     serverD.close();
   }
+});
+
+test("caller audio during EL connect is buffered and flushed after init; duplicate session.start ignored", async () => {
+  const fakeAgentE = new FakeAgent();
+  const connectElE = async (_c: BridgeConfig, _l: unknown, handlers: ElSessionHandlers): Promise<AgentPort> => {
+    await new Promise((r) => setTimeout(r, 80)); // simulate signed-URL mint + WS open latency
+    fakeAgentE.handlers = handlers;
+    return fakeAgentE;
+  };
+  const serverE = startServer(cfg, connectElE, null);
+  await new Promise<void>((r) => serverE.once("listening", () => r()));
+  const portE = (serverE.address() as AddressInfo).port;
+
+  const callId = "call-buffer-1";
+  const ts = Date.now();
+  const ws = new WebSocket(`ws://127.0.0.1:${portE}/voice/msteams/stream/${callId}`, {
+    headers: { "X-OpenClawTeamsBridge-Timestamp": String(ts), "X-OpenClawTeamsBridge-Signature": sign(cfg.workerSharedSecret, ts, callId) },
+  });
+  await new Promise<void>((r) => ws.once("open", () => r()));
+
+  // caller starts talking immediately after session.start, before the EL socket is open
+  ws.send(JSON.stringify({ type: "session.start", callId, threadId: "t", caller: {} }));
+  ws.send(JSON.stringify({ type: "audio.frame", seq: 1, timestampMs: 0, payloadBase64: "Zmlyc3Q=" }));
+  ws.send(JSON.stringify({ type: "audio.frame", seq: 2, timestampMs: 20, payloadBase64: "c2Vjb25k" }));
+  ws.send(JSON.stringify({ type: "session.start", callId, threadId: "t", caller: {} })); // duplicate — must be ignored
+
+  await until(() => (fakeAgentE.sent.filter((m) => m.user_audio_chunk).length >= 2 ? true : undefined));
+  const chunks = fakeAgentE.sent.filter((m) => m.user_audio_chunk).map((m) => m.user_audio_chunk);
+  assert.deepEqual(chunks, ["Zmlyc3Q=", "c2Vjb25k"], "buffered frames flush in order");
+  const initIdx = fakeAgentE.sent.findIndex((m) => m.type === "conversation_initiation_client_data");
+  const firstChunkIdx = fakeAgentE.sent.findIndex((m) => m.user_audio_chunk);
+  assert.ok(initIdx >= 0 && initIdx < firstChunkIdx, "conversation init must precede flushed audio");
+  assert.equal(
+    fakeAgentE.sent.filter((m) => m.type === "conversation_initiation_client_data").length, 1,
+    "duplicate session.start must not open a second EL session",
+  );
+  ws.close();
+  serverE.close();
 });
 
 test("look uses vision path 2 (describe) when a vision endpoint is configured — no upload, no gate", async () => {
