@@ -88,9 +88,26 @@ function optional(name: string): string | null {
   return v && v.trim() ? v.trim() : null;
 }
 
+/**
+ * Parse a numeric env var, failing LOUD on a non-numeric value. `Number("abc")`
+ * is NaN, which silently disables the governor (MAX_CALL_MINUTES) or throws an
+ * opaque listen error (PORT). A typo should stop startup with a clear message.
+ */
+function numFromEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") {
+    return fallback;
+  }
+  const n = Number(raw);
+  if (!Number.isFinite(n)) {
+    throw new Error(`Env var ${name}="${raw}" is not a number`);
+  }
+  return n;
+}
+
 export function loadConfig(): BridgeConfig {
   return {
-    port: Number(process.env.PORT ?? 8080),
+    port: numFromEnv("PORT", 8080),
     host: process.env.BIND ?? "0.0.0.0",
     workerSharedSecret: required("WORKER_SHARED_SECRET"),
     elevenLabsApiKey: required("ELEVENLABS_API_KEY"),
@@ -101,18 +118,18 @@ export function loadConfig(): BridgeConfig {
     elAgentBranchId: optional("EL_AGENT_BRANCH_ID"),
     elTtsVoiceId: optional("EL_TTS_VOICE_ID"),
     elTtsModelId: process.env.EL_TTS_MODEL_ID ?? "eleven_turbo_v2_5",
-    maxCallMinutes: Number(process.env.MAX_CALL_MINUTES ?? 0),
+    maxCallMinutes: numFromEnv("MAX_CALL_MINUTES", 0),
     goodbyeText:
       process.env.GOODBYE_TEXT ??
       "I'm sorry, we've reached the time limit for this call. Thank you for calling, goodbye!",
-    goodbyeGraceMs: Number(process.env.GOODBYE_GRACE_MS ?? 8000),
+    goodbyeGraceMs: numFromEnv("GOODBYE_GRACE_MS", 8000),
     visionApiUrl: optional("VISION_API_URL"),
     visionApiKey: optional("VISION_API_KEY"),
     visionModel: optional("VISION_MODEL"),
-    hmacFreshnessMs: Number(process.env.HMAC_FRESHNESS_MS ?? 60_000),
-    maxConnections: Number(process.env.MAX_CONNECTIONS ?? 0),
-    maxConnectionsPerIp: Number(process.env.MAX_CONNECTIONS_PER_IP ?? 0),
-    preStartTimeoutMs: Number(process.env.PRE_START_TIMEOUT_MS ?? 0),
+    hmacFreshnessMs: numFromEnv("HMAC_FRESHNESS_MS", 60_000),
+    maxConnections: numFromEnv("MAX_CONNECTIONS", 0),
+    maxConnectionsPerIp: numFromEnv("MAX_CONNECTIONS_PER_IP", 0),
+    preStartTimeoutMs: numFromEnv("PRE_START_TIMEOUT_MS", 0),
     logTranscripts: process.env.LOG_TRANSCRIPTS === "true",
   };
 }

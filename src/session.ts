@@ -34,6 +34,13 @@ const MAX_PENDING_AUDIO_FRAMES = 250;
  *  instead of letting a stalled worker balloon memory. Matches the siblings. */
 const MAX_OUTBOUND_BUFFER_BYTES = 1 * 1024 * 1024;
 
+/** Pending contextual-update cap while EL connects (participants/dtmf). */
+const MAX_PENDING_CONTEXT = 32;
+
+/** Extra headroom on top of the goodbye grace before the governor force-ends the
+ *  call, so a hung TTS synth can never wedge a time-limited call open (H3). */
+const GOODBYE_HARD_CAP_MS = 8_000;
+
 /** Injectable EL connector so tests can substitute a fake agent. */
 export type ElConnector = (cfg: BridgeConfig, log: Logger, handlers: ElSessionHandlers) => Promise<AgentPort>;
 
@@ -79,6 +86,12 @@ export class CallSession {
 
   // bridge-side call governor (spec §9)
   private governorTimer: NodeJS.Timeout | null = null;
+  // hard-bounded teardown timer for the goodbye grace (so a hung TTS can't wedge the call open)
+  private goodbyeTimer: NodeJS.Timeout | null = null;
+  // contextual updates (participants/dtmf) that arrived before the EL socket was open
+  private pendingContext: string[] = [];
+  // invoked exactly once when the session tears down (server uses it to de-register)
+  private readonly onClosed: (() => void) | undefined;
 
   constructor(
     cfg: BridgeConfig,
@@ -86,6 +99,7 @@ export class CallSession {
     callId: string,
     connectEl: ElConnector = ElAgentSocket.connect,
     vision: VisionDescriber | null = makeVisionDescriber(cfg),
+    onClosed?: () => void,
   ) {
     this.cfg = cfg;
     this.worker = worker;
@@ -93,6 +107,7 @@ export class CallSession {
     this.log = logger(`call:${callId.slice(0, 12)}`);
     this.connectEl = connectEl;
     this.vision = vision;
+    this.onClosed = onClosed;
 
     worker.on("message", (data) => {
       // parity with the EL side: a handler throw must not escape the ws
@@ -120,7 +135,9 @@ export class CallSession {
     }
     switch (msg.type) {
       case "session.start":
-        void this.onSessionStart(msg);
+        this.onSessionStart(msg).catch((err) =>
+          this.log.error(`session.start handling failed: ${(err as Error).message}`),
+        );
         break;
       case "audio.frame":
         // hot path: caller audio → agent, verbatim. While the EL socket is
@@ -139,14 +156,14 @@ export class CallSession {
         this.sendToWorker({ type: "pong", ts: msg.ts });
         break;
       case "participants":
-        this.el?.sendContextualUpdate(
+        this.pushContext(
           msg.count <= 1
             ? "This is a 1:1 call with a single human caller."
             : `There are ${msg.count} human participants on this call. Stay quiet unless directly addressed.`,
         );
         break;
       case "dtmf":
-        this.el?.sendContextualUpdate(`The caller pressed the "${msg.digit}" key on their keypad.`);
+        this.pushContext(`The caller pressed the "${msg.digit}" key on their keypad.`);
         break;
       case "recording.status":
         this.recordingActive = msg.status === "active";
@@ -157,7 +174,9 @@ export class CallSession {
         break;
       case "assistant.say":
         // worker-side governor (H4): speak, the worker tears down afterwards
-        void this.performGoodbye(msg.text);
+        this.performGoodbye(msg.text).catch((err) =>
+          this.log.error(`goodbye failed: ${(err as Error).message}`),
+        );
         break;
       case "session.end":
         this.log.info(`session.end from worker: ${msg.reason}`);
@@ -185,8 +204,9 @@ export class CallSession {
     this.log.info(`session.start (direction=${msg.direction ?? "inbound"}, recording=${msg.recordingStatus ?? "unknown"})`);
     this.recordingActive = msg.recordingStatus === "active";
 
+    let el: AgentPort;
     try {
-      this.el = await this.connectEl(this.cfg, this.log, {
+      el = await this.connectEl(this.cfg, this.log, {
         onMessage: (m) => this.onElMessage(m),
         onClose: (code, reason) => {
           this.log.info(`EL socket closed (${code} ${reason})`);
@@ -199,6 +219,21 @@ export class CallSession {
       this.endCall("agent-unavailable");
       return;
     }
+
+    // C1: the worker may have dropped (ring cancelled, rollout) DURING the connect
+    // above. If so, teardown already ran with this.el still null — assigning the
+    // just-opened socket now would orphan a live, billed ElevenLabs conversation
+    // that nothing ever closes. Close it and bail.
+    if (this.closed) {
+      this.log.info("worker closed during EL connect; closing the orphaned agent socket");
+      try {
+        el.close();
+      } catch {
+        /* already closing */
+      }
+      return;
+    }
+    this.el = el;
 
     // Per-call personalization (spec §6). CallerInfo fields are all nullable — default, never send null.
     this.el.sendConversationInit(
@@ -221,12 +256,20 @@ export class CallSession {
       this.el.sendAudioChunk(chunk);
     }
     this.pendingAudio = [];
+    // flush contextual updates (participants/dtmf) that arrived during the connect
+    // window — the "N humans, stay quiet" signal often lands right at join (MED-2)
+    for (const text of this.pendingContext) {
+      this.el.sendContextualUpdate(text);
+    }
+    this.pendingContext = [];
     this.log.info("ElevenLabs agent session open; relaying");
 
     // Bridge-side governor (spec §9): ElevenLabs doesn't know about your billing.
     if (this.cfg.maxCallMinutes > 0) {
       const limitMs = this.cfg.maxCallMinutes * 60_000;
-      this.governorTimer = setTimeout(() => void this.onGovernorLimit(), limitMs);
+      this.governorTimer = setTimeout(() => {
+        this.onGovernorLimit().catch((err) => this.log.error(`governor error: ${(err as Error).message}`));
+      }, limitMs);
       this.log.info(`governor armed: max ${this.cfg.maxCallMinutes} min`);
     }
   }
@@ -237,10 +280,41 @@ export class CallSession {
       return;
     }
     this.log.info("governor: call time limit reached");
+    // H3: guarantee teardown regardless of the goodbye. Arm a HARD-bounded
+    // deadline BEFORE awaiting performGoodbye — a hung/slow ElevenLabs TTS must
+    // never wedge the call open past its limit (the worker's H4 does the same).
+    const hardMs = this.cfg.goodbyeGraceMs + GOODBYE_HARD_CAP_MS;
+    this.goodbyeTimer = setTimeout(() => this.endCall("time-limit"), hardMs);
+    this.goodbyeTimer.unref?.();
+    // performGoodbye's TTS fetch is itself time-bounded (see synthesizeGoodbye).
     const playedMs = await this.performGoodbye(this.cfg.goodbyeText);
-    // deterministic TTS reports its real duration; the agent-side fallback doesn't
-    const graceMs = playedMs ?? this.cfg.goodbyeGraceMs;
-    setTimeout(() => this.endCall("time-limit"), graceMs + 500);
+    if (this.closed) {
+      return; // the hard deadline (or another path) already tore down
+    }
+    // Deterministic TTS reports its real duration; the agent-side fallback does
+    // not. Reschedule to the real grace, but never later than the hard cap.
+    const graceMs = Math.min(playedMs ?? this.cfg.goodbyeGraceMs, hardMs);
+    if (this.goodbyeTimer) {
+      clearTimeout(this.goodbyeTimer);
+    }
+    this.goodbyeTimer = setTimeout(() => this.endCall("time-limit"), graceMs + 500);
+    this.goodbyeTimer.unref?.();
+  }
+
+  /**
+   * Queue a contextual update (participants/dtmf). While the EL socket is still
+   * connecting it is buffered (MED-2) and flushed after conversation init, so a
+   * "N humans on the call" signal that lands right at join is not lost.
+   */
+  private pushContext(text: string): void {
+    if (this.el) {
+      this.el.sendContextualUpdate(text);
+    } else if (this.sessionStarted && !this.closed) {
+      this.pendingContext.push(text);
+      if (this.pendingContext.length > MAX_PENDING_CONTEXT) {
+        this.pendingContext.shift();
+      }
+    }
   }
 
   // ---- EL → bridge ----
@@ -338,10 +412,14 @@ export class CallSession {
         return;
       }
       case "show_image":
-        void this.onShowImage(call.tool_call_id, params);
+        this.onShowImage(call.tool_call_id, params).catch((err) =>
+          this.log.error(`show_image failed: ${(err as Error).message}`),
+        );
         return;
       case "look":
-        void this.onLook(call.tool_call_id, params);
+        this.onLook(call.tool_call_id, params).catch((err) =>
+          this.log.error(`look failed: ${(err as Error).message}`),
+        );
         return;
       default:
         this.el?.sendClientToolResult(call.tool_call_id, `tool "${call.tool_name}" is not implemented by this bridge`, true);
@@ -512,6 +590,12 @@ export class CallSession {
     this.worker.send(JSON.stringify(msg));
   }
 
+  /** Graceful external shutdown (e.g. SIGTERM drain): tell the worker the call
+   *  is ending, then close both sockets. Idempotent via teardown's closed flag. */
+  shutdown(reason: string): void {
+    this.endCall(reason);
+  }
+
   /** Ask the worker to tear the call down, then close both sockets. */
   private endCall(reason: string): void {
     if (!this.closed) {
@@ -530,6 +614,10 @@ export class CallSession {
       clearTimeout(this.governorTimer);
       this.governorTimer = null;
     }
+    if (this.goodbyeTimer) {
+      clearTimeout(this.goodbyeTimer);
+      this.goodbyeTimer = null;
+    }
     try {
       this.el?.close();
     } catch {
@@ -541,5 +629,13 @@ export class CallSession {
       /* already closing */
     }
     this.latestVideoFrame.clear();
+    this.pendingAudio = [];
+    this.pendingContext = [];
+    // let the server de-register this call (registry eviction, dup-callId dedup)
+    try {
+      this.onClosed?.();
+    } catch {
+      /* registry callback must never throw back into teardown */
+    }
   }
 }
