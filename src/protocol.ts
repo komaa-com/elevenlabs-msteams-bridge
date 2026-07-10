@@ -1,5 +1,5 @@
 /**
- * Worker wire protocol — mirror of OpenClawBridge/OpenClaw/Protocol.cs.
+ * Worker wire protocol: the JSON messages the StandIn media bridge speaks (discriminated on "type").
  * JSON, camelCase properties, discriminated on "type". The worker serializes
  * with System.Text.Json camelCase options; keep field names in exact sync.
  */

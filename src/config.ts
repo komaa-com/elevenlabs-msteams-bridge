@@ -1,7 +1,7 @@
 /**
  * Bridge configuration, entirely from environment variables (spec §8).
  * The worker-side contract (HMAC secret, wire protocol) must match the
- * OpenClawBridge MediaNode; the ElevenLabs side needs an API key and agent id.
+ * StandIn media bridge; the ElevenLabs side needs an API key and agent id.
  */
 
 export interface BridgeConfig {
@@ -9,7 +9,7 @@ export interface BridgeConfig {
   port: number;
   /** Bind address. */
   host: string;
-  /** Must equal the worker's OpenClawSharedSecret (HMAC upgrade check). */
+  /** Must equal the shared secret the StandIn media bridge signs with (HMAC upgrade check). */
   workerSharedSecret: string;
   /** Server-side ElevenLabs key; mints signed URLs, uploads files, calls TTS. */
   elevenLabsApiKey: string;
