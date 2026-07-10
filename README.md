@@ -36,9 +36,9 @@ Audio is relayed **verbatim** in both directions: both sides speak base64 PCM 16
 | 2. Context (conversation init dynamic variables, participants/dtmf → contextual_update) | Done |
 | 3. Barge-in polish (ghost-audio drop by event_id) | Done |
 | 4. Governor goodbye (assistant.say → standalone TTS, user_message fallback) | Done |
-| 5. Vision on-demand (frames are buffered per source; upload/multimodal not wired yet) | Groundwork |
+| 5. Vision on-demand (`look` client tool; path 2 describe-then-answer via any OpenAI-compatible vision endpoint, path 1 file upload + `multimodal_message`, recording-gated) | Done |
 | 6. Avatar | Nothing to do (RMS path, worker-side) |
-| 7. Client tools | `end_call` → session.end, `express` → expression, `show_image` → display.image (inline base64 or bridge-fetched URL); unknown tools return a tool error |
+| 7. Client tools | `end_call` → session.end, `express` → expression, `show_image` → display.image (inline base64 or bridge-fetched URL), `look` → vision; unknown tools return a tool error |
 
 ## Run
 
@@ -66,6 +66,15 @@ See `.env.example`. Notable:
 - `EL_TTS_VOICE_ID` — enables the deterministic governor goodbye (exact text via standalone TTS). Without it, the goodbye is delegated to the agent via `user_message`.
 - The agent's audio in/out format **must** be `pcm_16000` (agent settings); the bridge logs an error at call start if the conversation metadata reports anything else.
 - `conversation_config_override` fields (first message, prompt, voice) are rejected by ElevenLabs unless allowlisted in the agent's security settings.
+
+## Vision (`look` client tool)
+
+Define a client tool named `look` on the agent (parameters: optional `source` = `camera`|`screenshare`, optional `question`). When the agent calls it, the bridge grabs the latest buffered frame and answers one of two ways:
+
+1. **Path 2 (preferred, if `VISION_API_URL`/`VISION_MODEL` are set):** the frame goes to your OpenAI-compatible vision endpoint and the description comes back as the tool result. Transient processing, nothing persisted, works regardless of recording state.
+2. **Path 1 (fallback):** the frame is uploaded to the live ElevenLabs conversation and injected as a `multimodal_message` (the agent's LLM must be multimodal). Because this **persists** the frame with a third party, it is refused unless Teams recording is `active`.
+
+The other client tools the bridge maps: `end_call`, `express` (`{emotion}`), `show_image` (`{dataBase64, mime}` or `{url}`, jpeg/png).
 
 ## Privacy / recording gate
 

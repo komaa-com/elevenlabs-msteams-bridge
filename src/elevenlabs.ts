@@ -113,6 +113,36 @@ export async function getSignedUrl(cfg: BridgeConfig): Promise<string> {
 }
 
 /**
+ * Vision path 1 (spec §5): upload a frame to the LIVE conversation and get a
+ * file_id for multimodal_message. Requires the conversation_id captured from
+ * conversation_initiation_metadata. Note: this persists the frame with
+ * ElevenLabs — callers must gate it on Teams recording being active (spec §7).
+ */
+export async function uploadConversationFile(
+  cfg: BridgeConfig,
+  conversationId: string,
+  bytes: Buffer,
+  mime: string,
+): Promise<string> {
+  const url = `https://${cfg.elHost}/v1/convai/conversations/${encodeURIComponent(conversationId)}/files`;
+  const form = new FormData();
+  form.append("file", new Blob([new Uint8Array(bytes)], { type: mime }), mime === "image/png" ? "frame.png" : "frame.jpg");
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "xi-api-key": cfg.elevenLabsApiKey },
+    body: form,
+  });
+  if (!res.ok) {
+    throw new Error(`file upload failed: HTTP ${res.status} ${await res.text().catch(() => "")}`);
+  }
+  const body = (await res.json()) as { file_id?: string };
+  if (!body.file_id) {
+    throw new Error("file upload returned no file_id");
+  }
+  return body.file_id;
+}
+
+/**
  * Standalone TTS for the deterministic governor goodbye (spec §2 assistant.say):
  * synthesize the exact text as raw PCM16K and return the bytes.
  */
@@ -151,6 +181,8 @@ export interface AgentPort {
   sendContextualUpdate(text: string): void;
   sendUserMessage(text: string): void;
   sendClientToolResult(toolCallId: string, result: string, isError: boolean): void;
+  /** Vision path 1: upload the frame to the live conversation, then send multimodal_message. */
+  attachImage(bytes: Buffer, mime: string, question: string): Promise<void>;
   close(): void;
 }
 
@@ -158,18 +190,20 @@ export interface AgentPort {
 export class ElAgentSocket implements AgentPort {
   private ws: WebSocket;
   private readonly log: Logger;
+  private readonly cfg: BridgeConfig;
   conversationId: string | null = null;
 
-  private constructor(ws: WebSocket, log: Logger) {
+  private constructor(ws: WebSocket, log: Logger, cfg: BridgeConfig) {
     this.ws = ws;
     this.log = log;
+    this.cfg = cfg;
   }
 
   /** Open the agent WS (signed URL) and wire handlers. Resolves once the socket is open. */
   static async connect(cfg: BridgeConfig, log: Logger, handlers: ElSessionHandlers): Promise<ElAgentSocket> {
     const signedUrl = await getSignedUrl(cfg);
     const ws = new WebSocket(signedUrl);
-    const sock = new ElAgentSocket(ws, log);
+    const sock = new ElAgentSocket(ws, log, cfg);
 
     await new Promise<void>((resolve, reject) => {
       ws.once("open", () => resolve());
@@ -234,6 +268,23 @@ export class ElAgentSocket implements AgentPort {
 
   sendClientToolResult(toolCallId: string, result: string, isError: boolean): void {
     this.send({ type: "client_tool_result", tool_call_id: toolCallId, result, is_error: isError });
+  }
+
+  /**
+   * Vision path 1: upload the frame to the live conversation, then inject it as
+   * a multimodal user turn. Wire shape verified against the AsyncAPI:
+   * { type, text: { type: "user_message", text }, file: { type: "file_input", file_id } }.
+   */
+  async attachImage(bytes: Buffer, mime: string, question: string): Promise<void> {
+    if (!this.conversationId) {
+      throw new Error("no conversation_id yet (conversation_initiation_metadata not received)");
+    }
+    const fileId = await uploadConversationFile(this.cfg, this.conversationId, bytes, mime);
+    this.send({
+      type: "multimodal_message",
+      text: { type: "user_message", text: question },
+      file: { type: "file_input", file_id: fileId },
+    });
   }
 
   close(): void {

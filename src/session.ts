@@ -21,6 +21,7 @@ import {
   type ElPing,
   type ElSessionHandlers,
 } from "./elevenlabs.js";
+import { makeVisionDescriber, type VisionDescriber } from "./vision.js";
 
 /** Injectable EL connector so tests can substitute a fake agent. */
 export type ElConnector = (cfg: BridgeConfig, log: Logger, handlers: ElSessionHandlers) => Promise<AgentPort>;
@@ -38,6 +39,7 @@ export class CallSession {
   private readonly worker: WebSocket;
   private readonly log: Logger;
   private readonly connectEl: ElConnector;
+  private readonly vision: VisionDescriber | null;
 
   private el: AgentPort | null = null;
   private callId: string;
@@ -56,12 +58,19 @@ export class CallSession {
   // vision groundwork (spec §5): latest inbound frame per source, memory only
   private readonly latestVideoFrame = new Map<string, VideoFrameMessage>();
 
-  constructor(cfg: BridgeConfig, worker: WebSocket, callId: string, connectEl: ElConnector = ElAgentSocket.connect) {
+  constructor(
+    cfg: BridgeConfig,
+    worker: WebSocket,
+    callId: string,
+    connectEl: ElConnector = ElAgentSocket.connect,
+    vision: VisionDescriber | null = makeVisionDescriber(cfg),
+  ) {
     this.cfg = cfg;
     this.worker = worker;
     this.callId = callId;
     this.log = logger(`call:${callId.slice(0, 12)}`);
     this.connectEl = connectEl;
+    this.vision = vision;
 
     worker.on("message", (data) => this.onWorkerMessage(data as Buffer));
     worker.on("close", () => this.teardown("worker-closed"));
@@ -229,6 +238,9 @@ export class CallSession {
       case "show_image":
         void this.onShowImage(call.tool_call_id, params);
         return;
+      case "look":
+        void this.onLook(call.tool_call_id, params);
+        return;
       default:
         this.el?.sendClientToolResult(call.tool_call_id, `tool "${call.tool_name}" is not implemented by this bridge`, true);
         this.log.warn(`unmapped client tool: ${call.tool_name}`);
@@ -268,6 +280,64 @@ export class CallSession {
     } catch (err) {
       this.log.warn(`show_image failed: ${(err as Error).message}`);
       this.el?.sendClientToolResult(toolCallId, `show_image failed: ${(err as Error).message}`, true);
+    }
+  }
+
+  /**
+   * Vision on demand (spec §5) — agent client tool `look`
+   * ({source?: "camera"|"screenshare", question?: string}).
+   *
+   * Route: prefer path 2 (describe via YOUR vision model → answer in the tool
+   * result; frames are processed transiently, not persisted). Fall back to
+   * path 1 (upload to ElevenLabs + multimodal_message) — that one PERSISTS the
+   * frame with a third party, so it is gated on Teams recording being active
+   * (spec §7).
+   */
+  private async onLook(toolCallId: string, params: Record<string, unknown>): Promise<void> {
+    const requested = typeof params.source === "string" ? params.source : null;
+    const frame =
+      (requested && this.latestVideoFrame.get(requested)) ??
+      this.latestVideoFrame.get("screenshare") ??
+      this.latestVideoFrame.get("camera");
+    if (!frame) {
+      this.el?.sendClientToolResult(
+        toolCallId,
+        "no video is available — the caller has not shared their camera or screen",
+        true,
+      );
+      return;
+    }
+    const question =
+      typeof params.question === "string" && params.question.trim()
+        ? params.question.trim()
+        : "Describe what is visible.";
+    try {
+      if (this.vision) {
+        const description = await this.vision(frame, question);
+        this.el?.sendClientToolResult(toolCallId, description, false);
+        return;
+      }
+      if (!this.recordingActive) {
+        this.el?.sendClientToolResult(
+          toolCallId,
+          "cannot inspect video: Teams recording is not active, so frames may not be shared (and no local vision endpoint is configured)",
+          true,
+        );
+        return;
+      }
+      const who =
+        frame.source === "screenshare"
+          ? `screen shared by ${frame.participantName ?? "a participant"}`
+          : `camera of ${frame.participantName ?? "the caller"}`;
+      await this.el!.attachImage(
+        Buffer.from(frame.dataBase64, "base64"),
+        frame.mime,
+        `[live Teams frame: ${who}] ${question}`,
+      );
+      this.el?.sendClientToolResult(toolCallId, "the frame was attached to the conversation — answer based on it", false);
+    } catch (err) {
+      this.log.warn(`look failed: ${(err as Error).message}`);
+      this.el?.sendClientToolResult(toolCallId, `look failed: ${(err as Error).message}`, true);
     }
   }
 

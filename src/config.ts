@@ -23,6 +23,12 @@ export interface BridgeConfig {
   elTtsVoiceId: string | null;
   /** TTS model for the goodbye line. */
   elTtsModelId: string;
+  /** Vision path 2 (spec §5): OpenAI-compatible chat-completions URL for describe-then-inject. Null = path disabled. */
+  visionApiUrl: string | null;
+  /** Bearer key for the vision endpoint (optional — local endpoints may not need one). */
+  visionApiKey: string | null;
+  /** Vision model name (required when visionApiUrl is set). */
+  visionModel: string | null;
   /** Allowed clock skew for the HMAC timestamp, in ms (worker side documents ±60s). */
   hmacFreshnessMs: number;
   /** Log EL transcripts (still gated on Teams recording.status === "active", spec §7). */
@@ -53,6 +59,9 @@ export function loadConfig(): BridgeConfig {
     elEnvironment: optional("EL_ENVIRONMENT"),
     elTtsVoiceId: optional("EL_TTS_VOICE_ID"),
     elTtsModelId: process.env.EL_TTS_MODEL_ID ?? "eleven_turbo_v2_5",
+    visionApiUrl: optional("VISION_API_URL"),
+    visionApiKey: optional("VISION_API_KEY"),
+    visionModel: optional("VISION_MODEL"),
     hmacFreshnessMs: Number(process.env.HMAC_FRESHNESS_MS ?? 60_000),
     logTranscripts: process.env.LOG_TRANSCRIPTS === "true",
   };

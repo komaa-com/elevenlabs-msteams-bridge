@@ -47,6 +47,10 @@ class FakeAgent implements AgentPort {
   sendClientToolResult(toolCallId: string, result: string, isError: boolean): void {
     this.sent.push({ type: "client_tool_result", tool_call_id: toolCallId, result, is_error: isError });
   }
+  attached: Array<{ mime: string; question: string; bytes: number }> = [];
+  async attachImage(bytes: Buffer, mime: string, question: string): Promise<void> {
+    this.attached.push({ mime, question, bytes: bytes.length });
+  }
   close(): void {
     this.closed = true;
   }
@@ -61,10 +65,22 @@ const connectEl = async (_cfg: BridgeConfig, _log: unknown, handlers: ElSessionH
   return fakeAgent;
 };
 
-const server = startServer(cfg, connectEl);
+// server A: no vision endpoint (look routes to gated path 1)
+const server = startServer(cfg, connectEl, null);
 await new Promise<void>((r) => server.once("listening", () => r()));
 const port = (server.address() as AddressInfo).port;
 after(() => server.close());
+
+// server B: vision path 2 via a fake describer
+const fakeAgentB = new FakeAgent();
+const connectElB = async (_cfg: BridgeConfig, _log: unknown, handlers: ElSessionHandlers): Promise<AgentPort> => {
+  fakeAgentB.handlers = handlers;
+  return fakeAgentB;
+};
+const serverB = startServer({ ...cfg }, connectElB, async (frame, question) => `I see a ${frame.source} frame. Q was: ${question}`);
+await new Promise<void>((r) => serverB.once("listening", () => r()));
+const portB = (serverB.address() as AddressInfo).port;
+after(() => serverB.close());
 
 const CALL_ID = "call-e2e-1";
 
@@ -200,6 +216,29 @@ test("full relay: init, audio both ways, barge-in ghosts, ping/pong, context, go
   fakeAgent.emit({ type: "client_tool_call", client_tool_call: { tool_name: "teleport", tool_call_id: "t3" } });
   await until(() => fakeAgent.sent.find((m) => m.type === "client_tool_result" && m.tool_call_id === "t3" && m.is_error === true));
 
+  // look with no video shared → tool error
+  fakeAgent.emit({ type: "client_tool_call", client_tool_call: { tool_name: "look", tool_call_id: "v1", parameters: {} } });
+  await until(() => fakeAgent.sent.find((m) => m.tool_call_id === "v1" && m.is_error === true && String(m.result).includes("no video")));
+
+  // buffer a screenshare frame, recording NOT active → path 1 is gated (no vision endpoint on server A)
+  ws.send(JSON.stringify({
+    type: "video.frame", source: "screenshare", ts: 1, width: 640, height: 360,
+    mime: "image/jpeg", dataBase64: Buffer.from("jpegbytes").toString("base64"), participantName: "Sara",
+  }));
+  await new Promise((r) => setTimeout(r, 30)); // let the frame land in the buffer
+  fakeAgent.emit({ type: "client_tool_call", client_tool_call: { tool_name: "look", tool_call_id: "v2", parameters: { question: "what is on screen?" } } });
+  await until(() => fakeAgent.sent.find((m) => m.tool_call_id === "v2" && m.is_error === true && String(m.result).includes("recording")));
+  assert.equal(fakeAgent.attached.length, 0, "frame must NOT be uploaded before recording is active");
+
+  // recording active → path 1: frame uploaded + multimodal turn, success tool result
+  ws.send(JSON.stringify({ type: "recording.status", status: "active" }));
+  await new Promise((r) => setTimeout(r, 30));
+  fakeAgent.emit({ type: "client_tool_call", client_tool_call: { tool_name: "look", tool_call_id: "v3", parameters: { question: "what is on screen?" } } });
+  await until(() => fakeAgent.sent.find((m) => m.tool_call_id === "v3" && m.is_error === false));
+  assert.equal(fakeAgent.attached.length, 1);
+  assert.equal(fakeAgent.attached[0].mime, "image/jpeg");
+  assert.match(fakeAgent.attached[0].question, /Sara/);
+
   // governor goodbye without a TTS voice → user_message fallback
   ws.send(JSON.stringify({ type: "assistant.say", text: "Goodbye, thanks for calling." }));
   await until(() => fakeAgent.sent.find((m) => m.type === "user_message" && String(m.text).includes("Goodbye")));
@@ -208,4 +247,28 @@ test("full relay: init, audio both ways, barge-in ghosts, ping/pong, context, go
   ws.send(JSON.stringify({ type: "session.end", reason: "call-ended" }));
   await until(() => (fakeAgent.closed ? true : undefined));
   await until(() => (ws.readyState === WebSocket.CLOSED ? true : undefined));
+});
+
+test("look uses vision path 2 (describe) when a vision endpoint is configured — no upload, no gate", async () => {
+  const callId = "call-vision-1";
+  const ts = Date.now();
+  const ws = new WebSocket(`ws://127.0.0.1:${portB}/voice/msteams/stream/${callId}`, {
+    headers: { "X-OpenClawTeamsBridge-Timestamp": String(ts), "X-OpenClawTeamsBridge-Signature": sign(cfg.workerSharedSecret, ts, callId) },
+  });
+  await new Promise<void>((r) => ws.once("open", () => r()));
+  ws.send(JSON.stringify({ type: "session.start", callId, threadId: "t", caller: {} }));
+  await until(() => fakeAgentB.sent.find((m) => m.type === "conversation_initiation_client_data"));
+
+  // recording NOT active — path 2 is transient processing, allowed
+  ws.send(JSON.stringify({
+    type: "video.frame", source: "camera", ts: 1, width: 640, height: 360,
+    mime: "image/jpeg", dataBase64: Buffer.from("cam").toString("base64"),
+  }));
+  await new Promise((r) => setTimeout(r, 30));
+  fakeAgentB.emit({ type: "client_tool_call", client_tool_call: { tool_name: "look", tool_call_id: "w1", parameters: { question: "who is there?" } } });
+  const result = await until(() => fakeAgentB.sent.find((m) => m.tool_call_id === "w1"));
+  assert.equal(result.is_error, false);
+  assert.match(String(result.result), /camera frame.*who is there\?/);
+  assert.equal(fakeAgentB.attached.length, 0, "path 2 must not upload to ElevenLabs");
+  ws.close();
 });
