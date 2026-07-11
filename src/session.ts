@@ -30,6 +30,9 @@ const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 /** Pending caller-audio cap while EL connects: 250 × 20 ms = 5 s. */
 const MAX_PENDING_AUDIO_FRAMES = 250;
 
+/** 20 ms of PCM 16 kHz mono 16-bit = 16000 * 0.02 * 2 = 640 bytes (one hot-path frame). */
+const PCM16K_FRAME_BYTES = 640;
+
 /** Outbound (bridge→worker) send-buffer cap. Above this, drop realtime frames
  *  instead of letting a stalled worker balloon memory. Matches the siblings. */
 const MAX_OUTBOUND_BUFFER_BYTES = 1 * 1024 * 1024;
@@ -70,6 +73,9 @@ export class CallSession {
   // outbound audio bookkeeping (bridge → worker)
   private outSeq = 0;
   private outTimestampMs = 0;
+  // backpressure-warn throttle (avoid ~50 warn lines/s when a worker stalls)
+  private droppedFrames = 0;
+  private lastBackpressureWarnMs = 0;
 
   // barge-in ghost filter: drop EL audio with event_id <= the last interruption (spec §4)
   private lastInterruptEventId = -1;
@@ -214,9 +220,11 @@ export class CallSession {
     }
     this.sessionStarted = true;
     if (msg.callId && msg.callId !== this.callId) {
-      // must match the HMAC-authenticated callId in the URL path (wire contract)
+      // must match the HMAC-authenticated callId in the URL path (wire contract).
+      // Use endCall so the worker gets a session.end (clean reason) rather than a
+      // bare socket close it would log as an unexpected drop.
       this.log.error(`session.start callId ${msg.callId} != URL callId ${this.callId}; closing`);
-      this.teardown("callid-mismatch");
+      this.endCall("callid-mismatch");
       return;
     }
     this.log.info(`session.start (direction=${msg.direction ?? "inbound"}, recording=${msg.recordingStatus ?? "unknown"})`);
@@ -602,7 +610,12 @@ export class CallSession {
       try {
         this.muteAgentAudio = true; // only the deterministic goodbye may speak now
         const pcm = await synthesizeGoodbye(this.cfg, text);
-        this.emitAudioToWorker(pcm.toString("base64"));
+        // Emit as 20 ms frames like the hot path, rather than one multi-second
+        // frame, so playback does not depend on the worker re-aligning a giant
+        // chunk (parity with normal relay).
+        for (let off = 0; off < pcm.length; off += PCM16K_FRAME_BYTES) {
+          this.emitAudioToWorker(pcm.subarray(off, off + PCM16K_FRAME_BYTES).toString("base64"));
+        }
         return pcm16kBytesToMs(pcm.length);
       } catch (err) {
         this.muteAgentAudio = false; // fallback: the agent must stay audible
@@ -636,7 +649,17 @@ export class CallSession {
     // Above the cap, drop this frame rather than queue it — audio is realtime,
     // a stale frame is worthless, and this bounds memory (parity with siblings).
     if (this.worker.bufferedAmount > MAX_OUTBOUND_BUFFER_BYTES) {
-      this.log.warn(`dropping ${msg.type} — worker send buffer backpressure (${this.worker.bufferedAmount} bytes)`);
+      // Throttle the log: at ~50 frames/s a stalled worker would emit 50 warn
+      // lines/s. Count drops and warn at most once per second with the total.
+      this.droppedFrames++;
+      const now = Date.now();
+      if (now - this.lastBackpressureWarnMs >= 1000) {
+        this.log.warn(
+          `worker send backpressure: dropped ${this.droppedFrames} frame(s) (buffered ${this.worker.bufferedAmount} bytes)`,
+        );
+        this.lastBackpressureWarnMs = now;
+        this.droppedFrames = 0;
+      }
       return;
     }
     this.worker.send(JSON.stringify(msg));
