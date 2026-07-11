@@ -115,7 +115,13 @@ export async function getSignedUrl(cfg: BridgeConfig): Promise<string> {
   if (cfg.elEnvironment) {
     url.searchParams.set("environment", cfg.elEnvironment);
   }
-  const res = await fetch(url, { headers: { "xi-api-key": cfg.elevenLabsApiKey } });
+  // Time-bound: this is on the hot connect path (session.start). A hung API would
+  // otherwise leave onSessionStart awaiting forever - governor never armed, call
+  // never torn down (the same failure GOODBYE_TTS_TIMEOUT_MS guards).
+  const res = await fetch(url, {
+    headers: { "xi-api-key": cfg.elevenLabsApiKey },
+    signal: AbortSignal.timeout(EL_REST_TIMEOUT_MS),
+  });
   if (!res.ok) {
     throw new Error(`get-signed-url failed: HTTP ${res.status} ${await res.text().catch(() => "")}`);
   }
@@ -140,11 +146,12 @@ export async function uploadConversationFile(
 ): Promise<string> {
   const url = `https://${cfg.elHost}/v1/convai/conversations/${encodeURIComponent(conversationId)}/files`;
   const form = new FormData();
-  form.append("file", new Blob([new Uint8Array(bytes)], { type: mime }), mime === "image/png" ? "frame.png" : "frame.jpg");
+  form.append("file", new Blob([new Uint8Array(bytes)], { type: mime }), filenameForMime(mime));
   const res = await fetch(url, {
     method: "POST",
     headers: { "xi-api-key": cfg.elevenLabsApiKey },
     body: form,
+    signal: AbortSignal.timeout(EL_REST_TIMEOUT_MS),
   });
   if (!res.ok) {
     throw new Error(`file upload failed: HTTP ${res.status} ${await res.text().catch(() => "")}`);
@@ -159,6 +166,28 @@ export async function uploadConversationFile(
 /** Hard time bound on the goodbye-TTS fetch so a hung endpoint can't hold the
  *  governor's mute/goodbye open (the call's hard teardown deadline still fires). */
 const GOODBYE_TTS_TIMEOUT_MS = 10_000;
+
+/** Time bound on the two REST calls (signed URL, file upload) so a hung ElevenLabs
+ *  API can't wedge the call open. */
+const EL_REST_TIMEOUT_MS = 10_000;
+
+/** A safe upload filename whose extension matches the frame's MIME. The worker can
+ *  send any image type on a video.frame; labeling a webp body ".jpg" makes the file
+ *  API reject it, so derive the extension and reject anything not an image. */
+function filenameForMime(mime: string): string {
+  const ext: Record<string, string> = {
+    "image/jpeg": "jpg",
+    "image/jpg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+    "image/gif": "gif",
+  };
+  const e = ext[mime.toLowerCase()];
+  if (!e) {
+    throw new Error(`unsupported image mime for upload: ${mime}`);
+  }
+  return `frame.${e}`;
+}
 
 /**
  * Standalone TTS for the deterministic governor goodbye (spec §2 assistant.say):

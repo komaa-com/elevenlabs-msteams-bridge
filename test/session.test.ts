@@ -26,6 +26,12 @@ const cfg: BridgeConfig = {
   visionApiKey: null,
   visionModel: null,
   hmacFreshnessMs: 60_000,
+  maxConnections: 0,
+  maxConnectionsPerIp: 0,
+  preStartTimeoutMs: 0,
+  trustProxy: false,
+  tlsCertPath: null,
+  tlsKeyPath: null,
   logTranscripts: false,
 };
 

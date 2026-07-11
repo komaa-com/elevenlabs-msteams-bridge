@@ -1,4 +1,6 @@
-import { createServer, type IncomingMessage } from "node:http";
+import { createServer, type IncomingMessage, type Server } from "node:http";
+import { createServer as createHttpsServer } from "node:https";
+import { readFileSync } from "node:fs";
 import type { Duplex } from "node:stream";
 import { WebSocketServer } from "ws";
 import type { BridgeConfig } from "./config.js";
@@ -24,10 +26,10 @@ const log = logger("server");
 const MAX_INBOUND_PAYLOAD_BYTES = 2 * 1024 * 1024;
 /** Max concurrent worker connections (one per live call). */
 const DEFAULT_MAX_CONNECTIONS = 64;
-/** Max concurrent connections from one remote address. */
-const DEFAULT_MAX_CONNECTIONS_PER_IP = 8;
 /** A worker that authenticates but never sends session.start is dropped after this. */
 const DEFAULT_PRE_START_TIMEOUT_MS = 10_000;
+/** Bounded window for queued session.end frames + close handshakes to flush on shutdown. */
+const SHUTDOWN_GRACE_MS = 2_000;
 
 /** callId = last non-empty path segment of the upgrade URL. */
 export function callIdFromUrl(url: string | undefined): string | null {
@@ -36,7 +38,18 @@ export function callIdFromUrl(url: string | undefined): string | null {
   }
   const path = url.split("?")[0];
   const segments = path.split("/").filter(Boolean);
-  return segments.length > 0 ? decodeURIComponent(segments[segments.length - 1]) : null;
+  if (segments.length === 0) {
+    return null;
+  }
+  try {
+    // A malformed percent-escape (e.g. `%zz`) makes decodeURIComponent throw
+    // URIError. This runs inside the "upgrade" listener BEFORE auth, so an
+    // unguarded throw would be an uncaught exception that kills the process and
+    // drops every live call - a pre-auth remote crash. Treat it as no callId.
+    return decodeURIComponent(segments[segments.length - 1]);
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -103,8 +116,22 @@ export function authorizeUpgrade(
   return { callId };
 }
 
-/** Best-effort remote-IP key for the per-IP connection cap. */
-function remoteKey(req: IncomingMessage): string {
+/**
+ * Best-effort remote-IP key for the per-IP connection cap. StandIn is a hosted
+ * service dialing from a small set of egress IPs, and a reverse proxy/LB collapses
+ * every client to its own address - so keying on socket.remoteAddress alone makes
+ * the per-IP cap either useless (all one IP) or a footgun (throttles all calls).
+ * When `trustProxy` is set, use the FIRST X-Forwarded-For hop instead. Only enable
+ * it behind a proxy you control (the header is client-spoofable otherwise).
+ */
+function remoteKey(req: IncomingMessage, trustProxy: boolean): string {
+  if (trustProxy) {
+    const xff = req.headers["x-forwarded-for"];
+    const first = (Array.isArray(xff) ? xff[0] : xff)?.split(",")[0]?.trim();
+    if (first) {
+      return first;
+    }
+  }
   return req.socket.remoteAddress ?? "unknown";
 }
 
@@ -130,7 +157,10 @@ function wireDrainSignals(): void {
         /* keep draining the rest */
       }
     }
-    process.exit(0);
+    // shutdown() queues session.end + starts the close handshakes asynchronously;
+    // exiting immediately would cut those before they flush. Give a bounded window
+    // (only if there were live calls), then exit no matter what.
+    setTimeout(() => process.exit(0), sessions.length > 0 ? SHUTDOWN_GRACE_MS : 0);
   };
   process.once("SIGTERM", () => drain("SIGTERM"));
   process.once("SIGINT", () => drain("SIGINT"));
@@ -142,7 +172,12 @@ export function startServer(
   vision?: VisionDescriber | null,
 ): ReturnType<typeof createServer> {
   const maxConnections = cfg.maxConnections > 0 ? cfg.maxConnections : DEFAULT_MAX_CONNECTIONS;
-  const maxPerIp = cfg.maxConnectionsPerIp > 0 ? cfg.maxConnectionsPerIp : DEFAULT_MAX_CONNECTIONS_PER_IP;
+  // Per-IP cap defaults to the TOTAL cap (i.e. effectively off) rather than a low
+  // fixed number: the bridge's only legitimate client is StandIn, which dials from
+  // a small set of IPs, so a low per-IP cap would silently throttle total concurrent
+  // calls (the reported 8-call ceiling). Set MAX_CONNECTIONS_PER_IP explicitly (with
+  // TRUST_PROXY_XFF when behind a proxy) if you want a real per-IP limit.
+  const maxPerIp = cfg.maxConnectionsPerIp > 0 ? cfg.maxConnectionsPerIp : maxConnections;
   const preStartTimeoutMs = cfg.preStartTimeoutMs > 0 ? cfg.preStartTimeoutMs : DEFAULT_PRE_START_TIMEOUT_MS;
   const replay = new ReplayGuard(cfg.hmacFreshnessMs);
 
@@ -155,7 +190,7 @@ export function startServer(
   liveRegistries.add(sessions);
   wireDrainSignals();
 
-  const httpServer = createServer((req, res) => {
+  const onRequest = (req: IncomingMessage, res: import("node:http").ServerResponse): void => {
     if (req.url === "/healthz") {
       res.writeHead(200, { "content-type": "text/plain" });
       res.end("ok");
@@ -163,7 +198,22 @@ export function startServer(
     }
     res.writeHead(404);
     res.end();
-  });
+  };
+
+  // Native TLS (wss) when both cert + key are provided; otherwise plain WS, which
+  // MUST be fronted by a TLS terminator (tunnel / ingress / LB) - caller audio and
+  // video would otherwise cross the wire in plaintext.
+  let httpServer: Server;
+  if (cfg.tlsCertPath && cfg.tlsKeyPath) {
+    httpServer = createHttpsServer(
+      { cert: readFileSync(cfg.tlsCertPath), key: readFileSync(cfg.tlsKeyPath) },
+      onRequest,
+    ) as unknown as Server;
+    log.info("native TLS enabled (wss)");
+  } else {
+    httpServer = createServer(onRequest);
+    log.warn("no TLS_CERT_PATH/TLS_KEY_PATH: serving plain WS - front this with a TLS terminator in production");
+  }
 
   const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_INBOUND_PAYLOAD_BYTES });
 
@@ -174,7 +224,22 @@ export function startServer(
   };
 
   httpServer.on("upgrade", (req, socket, head) => {
-    const ip = remoteKey(req);
+    const ip = remoteKey(req, cfg.trustProxy);
+    // Defense in depth: any throw in this listener is an uncaught exception that
+    // kills the process (callIdFromUrl is now guarded, but never rely on one guard).
+    try {
+      processUpgrade(req, socket, head, ip);
+    } catch (err) {
+      log.error(`upgrade handler threw: ${(err as Error).message}`);
+      try {
+        socket.destroy();
+      } catch {
+        /* already gone */
+      }
+    }
+  });
+
+  function processUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer, ip: string): void {
     // Cheap caps first (before HMAC) so a flood can't force expensive crypto.
     if (openConnections >= maxConnections) {
       return reject(socket, "503 Service Unavailable", "server connection cap reached", ip);
@@ -235,7 +300,7 @@ export function startServer(
       );
       sessions.set(auth.callId, session);
     });
-  });
+  }
 
   httpServer.on("close", () => liveRegistries.delete(sessions));
 

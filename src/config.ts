@@ -47,10 +47,15 @@ export interface BridgeConfig {
   hmacFreshnessMs: number;
   /** Max concurrent worker connections (0 = default 64). */
   maxConnections: number;
-  /** Max concurrent connections from one remote IP (0 = default 8). */
+  /** Max concurrent connections from one remote IP (0 = default: same as maxConnections, i.e. no per-IP throttle). */
   maxConnectionsPerIp: number;
   /** Drop a worker that authenticates but never sends session.start after this many ms (0 = default 10s). */
   preStartTimeoutMs: number;
+  /** Trust X-Forwarded-For for the per-IP cap (only behind a proxy you control). */
+  trustProxy: boolean;
+  /** PEM cert/key paths for native TLS (wss). When both are set the bridge serves HTTPS itself; otherwise it is plain WS and MUST be fronted by a TLS terminator. */
+  tlsCertPath: string | null;
+  tlsKeyPath: string | null;
   /** Log EL transcripts (still gated on Teams recording.status === "active", spec §7). */
   logTranscripts: boolean;
 }
@@ -102,13 +107,20 @@ function numFromEnv(name: string, fallback: number): number {
   if (!Number.isFinite(n)) {
     throw new Error(`Env var ${name}="${raw}" is not a number`);
   }
+  // Fail loud on negatives too: e.g. MAX_CALL_MINUTES=-1 would pass Number.isFinite
+  // and then `maxCallMinutes > 0` silently disables the governor - the same
+  // silent-misconfig class numFromEnv exists to prevent. All these knobs are
+  // counts/durations/minutes where a negative is never meaningful.
+  if (n < 0) {
+    throw new Error(`Env var ${name}="${raw}" must not be negative`);
+  }
   return n;
 }
 
 export function loadConfig(): BridgeConfig {
   return {
     port: numFromEnv("PORT", 8080),
-    host: process.env.BIND ?? "0.0.0.0",
+    host: process.env.BIND?.trim() || "0.0.0.0",
     workerSharedSecret: required("WORKER_SHARED_SECRET"),
     elevenLabsApiKey: required("ELEVENLABS_API_KEY"),
     elevenLabsAgentId: required("ELEVENLABS_AGENT_ID"),
@@ -130,6 +142,9 @@ export function loadConfig(): BridgeConfig {
     maxConnections: numFromEnv("MAX_CONNECTIONS", 0),
     maxConnectionsPerIp: numFromEnv("MAX_CONNECTIONS_PER_IP", 0),
     preStartTimeoutMs: numFromEnv("PRE_START_TIMEOUT_MS", 0),
+    trustProxy: process.env.TRUST_PROXY_XFF === "true",
+    tlsCertPath: optional("TLS_CERT_PATH"),
+    tlsKeyPath: optional("TLS_KEY_PATH"),
     logTranscripts: process.env.LOG_TRANSCRIPTS === "true",
   };
 }
