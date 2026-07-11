@@ -5,7 +5,7 @@ import { sign, verify, isFresh } from "../src/hmac.js";
 
 // Fixed vector for the HMAC-SHA256(secret, "{timestampMs}.{callId}") hex-lower handshake the StandIn media bridge uses.
 // Recompute independently here so a refactor of sign() can't silently drift.
-test("sign matches the C# HmacSigner recipe", () => {
+test("sign matches the shared HMAC handshake recipe", () => {
   const secret = "test-secret";
   const ts = 1720000000000;
   const callId = "19:meeting_abc@thread.v2";

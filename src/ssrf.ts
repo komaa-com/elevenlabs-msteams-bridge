@@ -7,7 +7,7 @@ import { request as httpsRequest } from "node:https";
  * SSRF guard for agent-supplied URLs (show_image). The tool params come from
  * the agent's LLM, i.e. indirectly from the caller — a crafted prompt must not
  * be able to make the bridge fetch cloud metadata (169.254.169.254), loopback,
- * or RFC1918 hosts. Mirrors the worker's SsrfGuard.cs.
+ * or RFC1918 hosts. Mirrors the same guard the StandIn media bridge applies.
  *
  * The DNS-rebind TOCTOU (validate-then-fetch re-resolves, and the second answer
  * can be private) is CLOSED for fetchPublicImage: the actual connect goes
