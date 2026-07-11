@@ -10,9 +10,17 @@
 
 **`@komaa/elevenlabs-msteams-bridge`** puts an [ElevenLabs Agent](https://elevenlabs.io/docs/eleven-agents/api-reference/eleven-agents/websocket) on a real **Microsoft Teams call**. The hosted **StandIn media bridge** ([standin.komaa.com](https://standin.komaa.com)) joins the Teams call and dials into this bridge over an HMAC-authenticated WebSocket; the bridge opens one ElevenLabs Agent conversation per call and relays between them.
 
-```
-Microsoft Teams ⇄ StandIn media bridge ──HMAC WS──▶ this bridge ──WS──▶ ElevenLabs Agent
-      (call)          (hosted service)                 (yours)          (STT+LLM+TTS+VAD)
+```text
+Microsoft Teams call
+       |
+       v
+StandIn media bridge      (hosted; joins the call)
+       |   HMAC WebSocket, PCM 16 kHz
+       v
+this bridge               (you run it)
+       |   WebSocket
+       v
+ElevenLabs Agent          (STT + LLM + TTS + turn-taking)
 ```
 
 The hot path is **copy-only**: both sides speak base64 PCM 16 kHz mono (`pcm_16000`), so caller audio and agent audio are relayed **verbatim** in both directions. No resampling, no re-encoding, no transcoding.
