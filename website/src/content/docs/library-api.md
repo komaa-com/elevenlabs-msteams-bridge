@@ -24,19 +24,40 @@ server.on("listening", () => console.log("bridge up"));
 
 ## Custom vision hook
 
-The third argument to `startServer` is a `VisionDescriber` - your own answer to the agent's `look` tool. The raw frame never leaves your process; only the string you return is sent to the agent.
+The third argument to `startServer` is a `VisionDescriber` - your own answer to the agent's `look` tool. The raw frame never leaves your process; only the string you return is sent to the agent. This example uses OpenAI's vision model (`npm i openai`):
 
 ```ts
+import OpenAI from "openai";
 import { loadConfig, startServer, type VisionDescriber } from "@komaa/elevenlabs-msteams-bridge";
+
+const openai = new OpenAI(); // reads OPENAI_API_KEY
 
 const describe: VisionDescriber = async (frame, question) => {
   // frame: { source: "camera" | "screenshare", mime, dataBase64, width, height, participantName?, ... }
-  const bytes = Buffer.from(frame.dataBase64, "base64");
-  return await myModel.describe(bytes, question); // becomes the `look` tool result
+  const who = frame.source === "screenshare" ? "the caller's shared screen" : "the caller's camera";
+  const res = await openai.chat.completions.create({
+    model: "gpt-4o", // any vision-capable model
+    max_tokens: 300,
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: `This is ${who}. ${question}` },
+          {
+            type: "image_url",
+            image_url: { url: `data:${frame.mime};base64,${frame.dataBase64}`, detail: "low" },
+          },
+        ],
+      },
+    ],
+  });
+  return res.choices[0]?.message?.content ?? "I could not make out the image."; // becomes the `look` tool result
 };
 
 startServer(loadConfig(), undefined, describe);
 ```
+
+For **Azure OpenAI**, swap the client for `new AzureOpenAI({ endpoint, apiKey, apiVersion, deployment })` and keep the same `chat.completions.create` call (see the [README](https://github.com/komaa-com/elevenlabs-msteams-bridge#readme) for the full snippet).
 
 Pass `null` as the third argument to disable path-2 vision entirely (the agent then falls back to the recording-gated ElevenLabs multimodal upload). Omit it to use the built-in `makeVisionDescriber(cfg)`, which is driven by `VISION_API_URL`.
 
