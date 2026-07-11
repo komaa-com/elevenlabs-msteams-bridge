@@ -1,15 +1,20 @@
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
+import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
 
 /**
  * SSRF guard for agent-supplied URLs (show_image). The tool params come from
  * the agent's LLM, i.e. indirectly from the caller — a crafted prompt must not
  * be able to make the bridge fetch cloud metadata (169.254.169.254), loopback,
- * or RFC1918 hosts. Mirrors the intent of the worker's SsrfGuard.cs
- * (re-resolve + reject private/loopback/link-local/metadata). Residual DNS
- * TOCTOU is narrowed by `redirect: "error"` and the timeout at the call site;
- * full IP pinning (the worker's P2-6) is not implementable with plain fetch —
- * revisit with an undici Agent if this bridge ever fetches less-trusted URLs.
+ * or RFC1918 hosts. Mirrors the worker's SsrfGuard.cs.
+ *
+ * The DNS-rebind TOCTOU (validate-then-fetch re-resolves, and the second answer
+ * can be private) is CLOSED for fetchPublicImage: the actual connect goes
+ * through a guarded `lookup` that re-checks every address against the same
+ * private-range rules, so a rebind to a private IP fails at connect time —
+ * the http(s) stack's own resolution never runs unguarded (parity with the
+ * worker's P2-6 pinning).
  */
 
 type LookupFn = (hostname: string, opts: { all: true; verbatim: true }) => Promise<Array<{ address: string; family: number }>>;
@@ -146,4 +151,89 @@ export async function assertPublicHttpUrl(raw: string, lookupFn: LookupFn = look
     }
   }
   return url;
+}
+
+/**
+ * Fetch an image from an untrusted (agent/LLM-supplied) URL with the full SSRF
+ * posture: public http(s) host, no credentials, NO redirects, connect-time DNS
+ * guarded against rebind, bounded total time and body size. Returns the raw
+ * bytes and the response content-type.
+ */
+export async function fetchPublicImage(
+  rawUrl: string,
+  maxBytes: number,
+  timeoutMs = 10_000,
+  lookupFn: LookupFn = lookup,
+): Promise<{ bytes: Buffer; mime: string }> {
+  const url = await assertPublicHttpUrl(rawUrl, lookupFn);
+
+  // Connect-time guard: the http stack calls THIS to resolve the host, so a
+  // DNS rebind (public answer for the validation, private for the fetch) is
+  // rejected here instead of silently connecting to an internal address.
+  const guardedLookup = (
+    hostname: string,
+    options: { all?: boolean },
+    cb: (err: NodeJS.ErrnoException | null, address: unknown, family?: number) => void,
+  ): void => {
+    lookupFn(hostname, { all: true, verbatim: true }).then(
+      (addrs) => {
+        const bad = addrs.find((a) => isForbiddenIp(a.address));
+        if (bad || addrs.length === 0) {
+          cb(new Error(`DNS rebind blocked: ${hostname} resolved to ${bad?.address ?? "nothing"}`), null as never);
+          return;
+        }
+        if (options.all) {
+          cb(null, addrs);
+        } else {
+          cb(null, addrs[0].address, addrs[0].family);
+        }
+      },
+      (err) => cb(err as NodeJS.ErrnoException, null as never),
+    );
+  };
+
+  return new Promise((resolve, reject) => {
+    const req = (url.protocol === "https:" ? httpsRequest : httpRequest)(
+      url,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      { lookup: guardedLookup as any, headers: { accept: "image/*" } },
+      (res) => {
+        // no redirect following — a redirect is a guard bypass, treat as failure
+        if (res.statusCode !== 200) {
+          res.resume();
+          reject(new Error(`fetch ${rawUrl} → HTTP ${res.statusCode}`));
+          return;
+        }
+        const declared = Number(res.headers["content-length"] ?? NaN);
+        if (Number.isFinite(declared) && declared > maxBytes) {
+          res.destroy();
+          reject(new Error(`response too large (${declared} bytes, max ${maxBytes})`));
+          return;
+        }
+        const mime = (res.headers["content-type"] ?? "image/jpeg").split(";")[0].trim();
+        const chunks: Buffer[] = [];
+        let total = 0;
+        res.on("data", (chunk: Buffer) => {
+          total += chunk.length;
+          if (total > maxBytes) {
+            res.destroy();
+            reject(new Error(`response exceeded ${maxBytes} bytes; aborting read`));
+            return;
+          }
+          chunks.push(chunk);
+        });
+        res.on("end", () => resolve({ bytes: Buffer.concat(chunks), mime }));
+        res.on("error", reject);
+      },
+    );
+    // hard total deadline (the `timeout` option alone is only an idle timer)
+    const deadline = setTimeout(() => req.destroy(new Error(`fetch ${rawUrl} timed out after ${timeoutMs}ms`)), timeoutMs);
+    deadline.unref?.();
+    req.on("error", (err) => {
+      clearTimeout(deadline);
+      reject(err);
+    });
+    req.on("close", () => clearTimeout(deadline));
+    req.end();
+  });
 }

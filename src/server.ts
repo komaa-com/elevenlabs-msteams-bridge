@@ -8,6 +8,7 @@ import { isFresh, verify, SIGNATURE_HEADER, TIMESTAMP_HEADER } from "./hmac.js";
 import { logger } from "./log.js";
 import { CallSession, type ElConnector } from "./session.js";
 import { makeVisionDescriber, type VisionDescriber } from "./vision.js";
+import { metricDec, metricInc, renderMetrics } from "./metrics.js";
 
 const log = logger("server");
 
@@ -196,6 +197,11 @@ export function startServer(
       res.end("ok");
       return;
     }
+    if (req.url === "/metrics") {
+      res.writeHead(200, { "content-type": "text/plain; version=0.0.4" });
+      res.end(renderMetrics());
+      return;
+    }
     res.writeHead(404);
     res.end();
   };
@@ -242,18 +248,22 @@ export function startServer(
   function processUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer, ip: string): void {
     // Cheap caps first (before HMAC) so a flood can't force expensive crypto.
     if (openConnections >= maxConnections) {
+      metricInc("bridge_upgrades_rejected_cap_total");
       return reject(socket, "503 Service Unavailable", "server connection cap reached", ip);
     }
     if ((perIp.get(ip) ?? 0) >= maxPerIp) {
+      metricInc("bridge_upgrades_rejected_cap_total");
       return reject(socket, "503 Service Unavailable", "per-IP connection cap reached", ip);
     }
     const auth = authorizeUpgrade(cfg, req, replay);
     if ("error" in auth) {
+      metricInc("bridge_upgrades_rejected_auth_total");
       return reject(socket, "401 Unauthorized", auth.error, ip);
     }
     // A live session already owns this callId — a retry/rollout reconnect. Reject
     // rather than spin up a second billed ElevenLabs conversation for one call.
     if (sessions.has(auth.callId)) {
+      metricInc("bridge_upgrades_rejected_duplicate_total");
       return reject(socket, "409 Conflict", `callId ${auth.callId.slice(0, 12)}… already has a live session`, ip);
     }
     // Claim the connection slots BEFORE the async handleUpgrade callback runs —
@@ -280,6 +290,8 @@ export function startServer(
 
     wss.handleUpgrade(req, socket, head, (ws) => {
       log.info(`worker connected for call ${auth.callId.slice(0, 12)}… (${openConnections}/${maxConnections})`);
+      metricInc("bridge_calls_total");
+      metricInc("bridge_calls_active");
 
       const session = new CallSession(
         cfg,
@@ -309,6 +321,7 @@ export function startServer(
 
       ws.once("close", () => {
         clearTimeout(preStartTimer);
+        metricDec("bridge_calls_active");
         releaseSlots();
       });
     });

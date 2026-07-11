@@ -50,3 +50,20 @@ test("readBodyWithCap: content-length reject, streamed overrun reject, small bod
   const ok = await readBodyWithCap(new Response(new Uint8Array([1, 2, 3])), 512);
   assert.deepEqual([...ok], [1, 2, 3]);
 });
+
+test("fetchPublicImage blocks a DNS rebind: public at validation, private at connect", async () => {
+  let calls = 0;
+  const rebindLookup = async () => {
+    calls++;
+    // 1st call (validation) → public; 2nd call (connect-time) → private
+    return calls === 1
+      ? [{ address: "93.184.216.34", family: 4 }]
+      : [{ address: "169.254.169.254", family: 4 }];
+  };
+  const { fetchPublicImage } = await import("../src/ssrf.js");
+  await assert.rejects(
+    () => fetchPublicImage("http://rebind.example/img.jpg", 1024, 500, rebindLookup),
+    /rebind blocked/,
+  );
+  assert.ok(calls >= 2, "connect-time resolution must go through the guard");
+});
