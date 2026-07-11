@@ -51,6 +51,8 @@ export interface BridgeConfig {
   maxConnectionsPerIp: number;
   /** Drop a worker that authenticates but never sends session.start after this many ms (0 = default 10s). */
   preStartTimeoutMs: number;
+  /** Dead-peer window: end the call after this many ms without ANY worker message (0 = default 90s; the worker heartbeats every 30s). */
+  workerIdleTimeoutMs: number;
   /** Trust X-Forwarded-For for the per-IP cap (only behind a proxy you control). */
   trustProxy: boolean;
   /** PEM cert/key paths for native TLS (wss). When both are set the bridge serves HTTPS itself; otherwise it is plain WS and MUST be fronted by a TLS terminator. */
@@ -142,6 +144,7 @@ export function loadConfig(): BridgeConfig {
     maxConnections: numFromEnv("MAX_CONNECTIONS", 0),
     maxConnectionsPerIp: numFromEnv("MAX_CONNECTIONS_PER_IP", 0),
     preStartTimeoutMs: numFromEnv("PRE_START_TIMEOUT_MS", 0),
+    workerIdleTimeoutMs: numFromEnv("WORKER_IDLE_TIMEOUT_MS", 0),
     trustProxy: process.env.TRUST_PROXY_XFF === "true",
     tlsCertPath: optional("TLS_CERT_PATH"),
     tlsKeyPath: optional("TLS_KEY_PATH"),

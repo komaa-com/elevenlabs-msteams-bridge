@@ -256,39 +256,30 @@ export function startServer(
     if (sessions.has(auth.callId)) {
       return reject(socket, "409 Conflict", `callId ${auth.callId.slice(0, 12)}… already has a live session`, ip);
     }
+    // Claim the connection slots BEFORE the async handleUpgrade callback runs —
+    // a burst of simultaneous upgrades could otherwise all pass the cap checks
+    // above and transiently exceed the caps. Released exactly once, whether the
+    // ws is adopted (its close event) or the raw socket dies un-adopted.
+    openConnections++;
+    perIp.set(ip, (perIp.get(ip) ?? 0) + 1);
+    let released = false;
+    const releaseSlots = (): void => {
+      if (released) {
+        return;
+      }
+      released = true;
+      openConnections = Math.max(0, openConnections - 1);
+      const n = (perIp.get(ip) ?? 1) - 1;
+      if (n <= 0) {
+        perIp.delete(ip);
+      } else {
+        perIp.set(ip, n);
+      }
+    };
+    socket.once("close", releaseSlots); // covers the never-adopted path
+
     wss.handleUpgrade(req, socket, head, (ws) => {
-      openConnections++;
-      perIp.set(ip, (perIp.get(ip) ?? 0) + 1);
       log.info(`worker connected for call ${auth.callId.slice(0, 12)}… (${openConnections}/${maxConnections})`);
-
-      // Drop a worker that authenticates but never starts a call (idle-socket leak).
-      let started = false;
-      const preStartTimer = setTimeout(() => {
-        if (!started) {
-          log.warn(`call ${auth.callId.slice(0, 12)}… sent no session.start in ${preStartTimeoutMs}ms; closing`);
-          try {
-            ws.close(1008, "no session.start");
-          } catch {
-            /* already closing */
-          }
-        }
-      }, preStartTimeoutMs);
-      preStartTimer.unref?.();
-      ws.once("message", () => {
-        started = true;
-        clearTimeout(preStartTimer);
-      });
-
-      ws.once("close", () => {
-        clearTimeout(preStartTimer);
-        openConnections = Math.max(0, openConnections - 1);
-        const n = (perIp.get(ip) ?? 1) - 1;
-        if (n <= 0) {
-          perIp.delete(ip);
-        } else {
-          perIp.set(ip, n);
-        }
-      });
 
       const session = new CallSession(
         cfg,
@@ -299,6 +290,27 @@ export function startServer(
         () => sessions.delete(auth.callId), // evict on teardown (dedup + drain registry)
       );
       sessions.set(auth.callId, session);
+
+      // Drop a worker that authenticates but never STARTS a call. The timer asks
+      // the session whether session.start actually arrived — clearing on the
+      // first message of any type would let an authenticated client hold the
+      // socket forever by sending pings (review MED: pre-start bypass).
+      const preStartTimer = setTimeout(() => {
+        if (!session.hasStarted) {
+          log.warn(`call ${auth.callId.slice(0, 12)}… sent no session.start in ${preStartTimeoutMs}ms; closing`);
+          try {
+            ws.close(1008, "no session.start");
+          } catch {
+            /* already closing */
+          }
+        }
+      }, preStartTimeoutMs);
+      preStartTimer.unref?.();
+
+      ws.once("close", () => {
+        clearTimeout(preStartTimer);
+        releaseSlots();
+      });
     });
   }
 

@@ -24,7 +24,8 @@ Verification (`401` on failure): the timestamp must be within the freshness wind
 | Per-IP cap | 8 (`MAX_CONNECTIONS_PER_IP`) |
 | Max inbound frame | 2 MB |
 | Outbound backpressure cap | 1 MB (drops realtime frames above it) |
-| Pre-start timeout | 10 s (`PRE_START_TIMEOUT_MS`) - drops a socket that never sends `session.start` |
+| Pre-start timeout | 10 s (`PRE_START_TIMEOUT_MS`) - drops a socket that never sends `session.start` (only a real `session.start` clears it) |
+| Worker idle timeout | 90 s (`WORKER_IDLE_TIMEOUT_MS`) - dead-peer detection: ends the call after 3 missed 30 s heartbeats, freeing the call id and the ElevenLabs conversation |
 | Duplicate call id | rejected with `409` - no second billed conversation for one call |
 
 Audio on both sides is base64 **PCM 16 kHz, 16-bit, mono**.
