@@ -56,14 +56,22 @@ Node.js `>= 20`. One runtime dependency (`ws`).
 
 ### 1. As a CLI (env-configured)
 
+Set the three required variables, then run it:
+
 ```bash
-ELEVENLABS_API_KEY=sk_... \
-ELEVENLABS_AGENT_ID=agent_... \
-WORKER_SHARED_SECRET=... \
-  npx @komaa/elevenlabs-msteams-bridge
+export ELEVENLABS_API_KEY=sk_...
+export ELEVENLABS_AGENT_ID=agent_...
+export WORKER_SHARED_SECRET=...
+npx @komaa/elevenlabs-msteams-bridge
 ```
 
-Every option is an environment variable; see [`.env.example`](./.env.example) (it ships with the package) and the [Configuration Reference](https://komaa-com.github.io/elevenlabs-msteams-bridge/configuration-reference/).
+Or keep them in a `.env` file (copy [`.env.example`](./.env.example), which ships with the package) and load it:
+
+```bash
+node --env-file=.env node_modules/.bin/elevenlabs-msteams-bridge
+```
+
+Every option is an environment variable; see the [Configuration Reference](https://komaa-com.github.io/elevenlabs-msteams-bridge/configuration-reference/).
 
 ### 2. As a library
 
@@ -137,7 +145,41 @@ StandIn is the hosted service that joins the Teams call and dials into this brid
 2. Set `WORKER_SHARED_SECRET` to the **shared secret from pairing** - the two sides must match exactly, or the handshake is rejected with 401.
 3. Call your Teams bot (or the sandbox meeting). StandIn joins, dials the bridge, and your ElevenLabs agent answers.
 
-> **Use TLS (wss).** The bridge listens on plain WS by default, so caller audio and video would cross the wire in plaintext. Terminate TLS in front of it (a tunnel such as Tailscale Funnel, an ingress, or a load balancer), **or** set `TLS_CERT_PATH` + `TLS_KEY_PATH` to have the bridge serve `wss://` natively. Always give StandIn a `wss://` URL.
+### Expose it (make it reachable by StandIn)
+
+StandIn is a hosted service, so it dials your bridge **from the internet**. If you run the bridge on your laptop or a private host, put a tunnel in front of it: the tunnel gives you a public `https://`/`wss://` URL and terminates TLS for you (so you also satisfy the `wss://` requirement below). Point it at the bridge's port (default `8080`), and give StandIn the resulting `wss://<public-host>/voice/msteams/stream` URL.
+
+Pick whichever you already use:
+
+**Tailscale Funnel** (free, no account juggling if you have Tailscale):
+
+```bash
+tailscale funnel --bg --https=8080 8080
+```
+
+Your URL is then `wss://<machine>.<tailnet>.ts.net:8080/voice/msteams/stream`.
+
+**Cloudflare Tunnel** (free, custom or `trycloudflare.com` hostname):
+
+```bash
+cloudflared tunnel --url http://localhost:8080
+```
+
+**ngrok**:
+
+```bash
+ngrok http 8080
+```
+
+**VS Code / dev tunnels** (`devtunnel`):
+
+```bash
+devtunnel host -p 8080 --allow-anonymous
+```
+
+Each prints a public `https://…` host; give StandIn the `wss://…/voice/msteams/stream` form of it. For a fixed production host, run the bridge behind an ingress or load balancer instead, or serve TLS natively with `TLS_CERT_PATH` + `TLS_KEY_PATH`.
+
+> **Always use TLS (wss).** Without a tunnel or terminator in front, the bridge serves plain WS and caller audio/video cross the wire in plaintext. The tunnels above terminate TLS for you; a raw `ws://` URL should never be given to StandIn outside local testing.
 
 Details and the tier walk-through: [Connecting to StandIn](https://komaa-com.github.io/elevenlabs-msteams-bridge/connecting-to-standin/).
 

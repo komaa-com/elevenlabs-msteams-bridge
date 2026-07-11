@@ -17,22 +17,65 @@ A minimal, runnable embedding of [`@komaa/elevenlabs-msteams-bridge`](https://ww
 
 ## Run it
 
+Install, create your `.env`, and start:
+
 ```bash
 npm install
-cp .env.example .env    # then edit .env
+```
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env`, then:
+
+```bash
 npm start
 ```
 
 You should see the bridge start and print the WebSocket URL to give StandIn:
 
-```
+```text
 basic-bridge example is up.
 Point your StandIn identity's agent WebSocket URL at ws://<this-host>:8080/voice/msteams/stream
 ```
 
 > **No credentials yet?** The example still starts and listens with dummy values for the three
-> required variables - handy for checking the wiring. A real call needs real values and a StandIn
-> identity pointed at a URL that can reach this process (a public wss:// endpoint or a tunnel).
+> required variables - handy for checking the wiring.
+
+## Make it reachable by StandIn
+
+StandIn dials your bridge **from the internet**, so a laptop/private host needs a tunnel. The tunnel
+gives you a public `wss://` URL and terminates TLS for you. Run one alongside `npm start`, pointing at
+port `8080`, then give StandIn the `wss://…/voice/msteams/stream` form of the printed host.
+
+Tailscale Funnel:
+
+```bash
+tailscale funnel --bg --https=8080 8080
+```
+
+Cloudflare Tunnel (quick, throwaway hostname):
+
+```bash
+cloudflared tunnel --url http://localhost:8080
+```
+
+ngrok:
+
+```bash
+ngrok http 8080
+```
+
+VS Code dev tunnels:
+
+```bash
+devtunnel host -p 8080 --allow-anonymous
+```
+
+Then set your StandIn identity's **agent WebSocket URL** to `wss://<the-public-host>/voice/msteams/stream`
+and its shared secret to your `WORKER_SHARED_SECRET`. Never give StandIn a plain `ws://` URL outside
+local testing.
 
 ## The .env, variable by variable
 
