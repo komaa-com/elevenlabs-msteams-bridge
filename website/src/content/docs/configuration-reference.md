@@ -57,6 +57,8 @@ The bridge is configured entirely from environment variables. The package ships 
 | `PRE_START_TIMEOUT_MS` | `0` (= 10000) | Drop a connection that authenticates but never sends `session.start`. |
 | `WORKER_IDLE_TIMEOUT_MS` | `0` (= 90000) | Dead-peer window: end the call after this long without any worker message (the worker heartbeats every 30 s). Frees the call id for reconnect and closes the billed ElevenLabs conversation. |
 | `LOG_TRANSCRIPTS` | `false` | Log ElevenLabs transcripts (still gated on Teams `recording.status == "active"`). |
+
+The bridge also exposes `GET /metrics` (Prometheus text format, no auth): calls total/active, call seconds, upgrade rejections by cause, frames relayed each way, backpressure drops, and ElevenLabs connect failures. Like `/healthz` it is served on the same port - keep the port private to your network or scrape through your ingress.
 | `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error`. An invalid value falls back to `info`. |
 
 :::note

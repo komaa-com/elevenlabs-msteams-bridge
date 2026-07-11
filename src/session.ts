@@ -22,7 +22,8 @@ import {
   type ElSessionHandlers,
 } from "./elevenlabs.js";
 import { makeVisionDescriber, type VisionDescriber } from "./vision.js";
-import { assertPublicHttpUrl, readBodyWithCap } from "./ssrf.js";
+import { fetchPublicImage } from "./ssrf.js";
+import { metricInc } from "./metrics.js";
 
 /** show_image fetch cap: display.image goes to a 640×360 tile; 5 MB is generous. */
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
@@ -192,6 +193,7 @@ export class CallSession {
         // first words; flushed right after conversation init.
         if (this.el) {
           this.el.sendAudioChunk(msg.payloadBase64);
+          metricInc("bridge_frames_to_agent_total");
           this.noteSpeaker(msg.speakerName);
         } else if (this.sessionStarted) {
           this.pendingAudio.push(msg.payloadBase64);
@@ -272,6 +274,7 @@ export class CallSession {
         onError: (err) => this.log.warn(`EL socket error: ${err.message}`),
       });
     } catch (err) {
+      metricInc("bridge_el_connect_failures_total");
       this.log.error(`could not open ElevenLabs session: ${(err as Error).message}`);
       this.endCall("agent-unavailable");
       return;
@@ -518,15 +521,12 @@ export class CallSession {
       const url = typeof params.url === "string" ? params.url : null;
       if (!dataBase64 && url) {
         // SSRF guard: the URL is agent-(LLM-)controlled, i.e. indirectly caller-controlled.
-        // Public hosts only, no redirects (rebind bypass), bounded time and size.
-        const safeUrl = await assertPublicHttpUrl(url);
-        const res = await fetch(safeUrl, { redirect: "error", signal: AbortSignal.timeout(10_000) });
-        if (!res.ok) {
-          throw new Error(`fetch ${url} → HTTP ${res.status}`);
-        }
-        mime = res.headers.get("content-type")?.split(";")[0] ?? "image/jpeg";
-        const body = await readBodyWithCap(res, MAX_IMAGE_BYTES); // streams; rejects before buffering an oversized body
-        dataBase64 = body.toString("base64");
+        // fetchPublicImage validates the host, then PINS the connect-time DNS
+        // resolution through the same private-range check — closing the
+        // validate-then-fetch rebind TOCTOU. No redirects, bounded time and size.
+        const img = await fetchPublicImage(url, MAX_IMAGE_BYTES, 10_000);
+        mime = img.mime;
+        dataBase64 = img.bytes.toString("base64");
       }
       if (!dataBase64 || !mime || !/^image\/(jpeg|png)$/.test(mime)) {
         throw new Error("show_image needs {dataBase64, mime} or {url} resolving to image/jpeg or image/png");
@@ -671,6 +671,7 @@ export class CallSession {
     };
     // advance the timeline by the actual PCM duration (base64 → bytes → ms)
     this.outTimestampMs += pcm16kBytesToMs(Buffer.byteLength(base64Pcm, "base64"));
+    metricInc("bridge_frames_to_worker_total");
     this.sendToWorker(frame);
   }
 
@@ -690,6 +691,7 @@ export class CallSession {
       // Throttle the log: at ~50 frames/s a stalled worker would emit 50 warn
       // lines/s. Count drops and warn at most once per second with the total.
       this.droppedFrames++;
+      metricInc("bridge_frames_dropped_total");
       const now = Date.now();
       if (now - this.lastBackpressureWarnMs >= 1000) {
         this.log.warn(

@@ -1,6 +1,6 @@
 {
   "name": "@komaa/elevenlabs-msteams-bridge",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "description": "Bridge Microsoft Teams voice/video calls to an ElevenLabs Agent. Terminates the StandIn media bridge wire protocol on one side and the ElevenLabs Agent WebSocket on the other. No transcoding: PCM 16k verbatim both ways, barge-in, on-demand vision, call governors.",
   "keywords": [
     "elevenlabs",

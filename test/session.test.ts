@@ -472,3 +472,14 @@ test("look uses vision path 2 (describe) when a vision endpoint is configured â€
   assert.equal(fakeAgentB.attached.length, 0, "path 2 must not upload to ElevenLabs");
   ws.close();
 });
+
+test("GET /metrics exposes call/relay counters in Prometheus format", async () => {
+  const res = await fetch(`http://127.0.0.1:${port}/metrics`);
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get("content-type") ?? "", /text\/plain/);
+  const body = await res.text();
+  assert.match(body, /# TYPE bridge_calls_total counter/);
+  assert.match(body, /bridge_calls_total [1-9]/, "earlier tests in this file created calls");
+  assert.match(body, /bridge_frames_to_worker_total [1-9]/);
+  assert.match(body, /# TYPE bridge_calls_active gauge/);
+});

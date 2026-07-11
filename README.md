@@ -33,6 +33,7 @@ The hot path is **copy-only**: both sides speak base64 PCM 16 kHz mono (`pcm_160
 - **Vision on demand** - a `look` client tool lets the agent see the caller's camera or screen-share: describe-then-answer via any OpenAI-compatible vision endpoint, or native multimodal upload (recording-gated). See [Vision](#vision-look-client-tool).
 - **Agent client tools** - `end_call`, `express` (avatar emotion), `show_image` (image on the bot's video tile, SSRF-guarded), `look`.
 - **Two call governors** - a StandIn-side cutoff the bridge speaks a goodbye for, and a bridge-side `MAX_CALL_MINUTES` hard cap with a deterministic TTS goodbye.
+- **Observability** - `GET /healthz` for liveness and `GET /metrics` (Prometheus text format): calls, durations, rejects, relay/drop counters.
 - **Hardened transport** - replay-proof HMAC upgrade, single-use handshake guard, connection caps, payload caps, backpressure bounds, pre-start timeout, duplicate-call rejection, graceful SIGTERM drain, and an `EL_HOST` allowlist so your API key can only be sent to ElevenLabs.
 - **Group-call awareness** - participant counts and DTMF digits are fed to the agent as contextual updates ("3 humans on the call, stay quiet unless addressed").
 
