@@ -310,7 +310,10 @@ export class ElAgentSocket implements AgentPort {
   /** Mint a signed URL and open the socket once; rejects on either failure. */
   private static async openOnce(cfg: BridgeConfig): Promise<WebSocket> {
     const signedUrl = await getSignedUrl(cfg);
-    const ws = new WebSocket(signedUrl);
+    // Bound the WS open like the REST calls: without handshakeTimeout, a
+    // blackholed TCP connect or a stalled TLS/upgrade handshake would hang
+    // onSessionStart forever (the governor is only armed after connect).
+    const ws = new WebSocket(signedUrl, { handshakeTimeout: EL_REST_TIMEOUT_MS });
     try {
       await new Promise<void>((resolve, reject) => {
         ws.once("open", () => resolve());

@@ -30,6 +30,7 @@ const baseCfg: BridgeConfig = {
   maxConnections: 0,
   maxConnectionsPerIp: 0,
   preStartTimeoutMs: 0,
+  workerIdleTimeoutMs: 0,
   trustProxy: false,
   tlsCertPath: null,
   tlsKeyPath: null,
@@ -175,4 +176,89 @@ test("loadConfig throws on a non-numeric MAX_CALL_MINUTES", () => {
     if (prev === undefined) delete process.env.MAX_CALL_MINUTES;
     else process.env.MAX_CALL_MINUTES = prev;
   }
+});
+
+test("dead-peer: a silent worker socket is torn down after the idle window and the callId is freed", async () => {
+  const fake = new (class {
+    conversationId = "conv_idle";
+    isOpen = true;
+    sent: Array<Record<string, unknown>> = [];
+    closed = false;
+    handlers!: import("../src/elevenlabs.js").ElSessionHandlers;
+    sendAudioChunk(): void {}
+    sendConversationInit(m: Record<string, unknown>): void { this.sent.push(m); }
+    sendPong(): void {}
+    sendContextualUpdate(): void {}
+    sendUserMessage(): void {}
+    sendClientToolResult(): void {}
+    async attachImage(): Promise<void> {}
+    close(): void { this.closed = true; }
+  })();
+  const connect = async (_c: unknown, _l: unknown, handlers: import("../src/elevenlabs.js").ElSessionHandlers) => {
+    fake.handlers = handlers;
+    return fake;
+  };
+  // 150ms idle window (check interval = max(20, 150/3) = 50ms)
+  const server = startServer({ ...baseCfg, workerIdleTimeoutMs: 150 }, connect as never, null);
+  await new Promise<void>((r) => server.once("listening", () => r()));
+  const port = (server.address() as AddressInfo).port;
+
+  const callId = "call-idle-1";
+  const ts = Date.now();
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/voice/msteams/stream/${callId}`, {
+    headers: { "X-OpenClawTeamsBridge-Timestamp": String(ts), "X-OpenClawTeamsBridge-Signature": sign(baseCfg.workerSharedSecret, ts, callId) },
+  });
+  await new Promise<void>((r) => ws.once("open", () => r()));
+  const received: Array<Record<string, unknown>> = [];
+  ws.on("message", (d) => received.push(JSON.parse(d.toString())));
+  ws.send(JSON.stringify({ type: "session.start", callId, threadId: "t", caller: {} }));
+  await until(() => fake.sent.find((m) => m.type === "conversation_initiation_client_data"));
+
+  // keep-alive traffic holds the session open past the window...
+  for (let i = 0; i < 4; i++) {
+    await new Promise((r) => setTimeout(r, 60));
+    ws.send(JSON.stringify({ type: "ping", ts: i }));
+  }
+  assert.equal(ws.readyState, WebSocket.OPEN, "active session must survive the idle window");
+
+  // ...then true silence tears it down and frees the callId (no 409 lockout)
+  const end = await until(() => received.find((m) => m.type === "session.end"), 2000);
+  assert.equal(end.reason, "worker-idle-timeout");
+  await until(() => (fake.closed ? true : undefined));
+  await until(() => (ws.readyState === WebSocket.CLOSED ? true : undefined));
+
+  const ts2 = Date.now();
+  const ws2 = new WebSocket(`ws://127.0.0.1:${port}/voice/msteams/stream/${callId}`, {
+    headers: { "X-OpenClawTeamsBridge-Timestamp": String(ts2), "X-OpenClawTeamsBridge-Signature": sign(baseCfg.workerSharedSecret, ts2, callId) },
+  });
+  await new Promise<void>((resolve, reject) => {
+    ws2.once("open", () => resolve());
+    ws2.once("error", (e) => reject(new Error(`reconnect after idle teardown must not 409: ${e.message}`)));
+  });
+  ws2.close();
+  server.close();
+});
+
+test("pre-start bypass closed: pings without session.start no longer defuse the timer", async () => {
+  const connect = async () => {
+    throw new Error("EL must never be dialed for a never-started session");
+  };
+  const server = startServer({ ...baseCfg, preStartTimeoutMs: 200 }, connect as never, null);
+  await new Promise<void>((r) => server.once("listening", () => r()));
+  const port = (server.address() as AddressInfo).port;
+
+  const callId = "call-nostart-1";
+  const ts = Date.now();
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/voice/msteams/stream/${callId}`, {
+    headers: { "X-OpenClawTeamsBridge-Timestamp": String(ts), "X-OpenClawTeamsBridge-Signature": sign(baseCfg.workerSharedSecret, ts, callId) },
+  });
+  await new Promise<void>((r) => ws.once("open", () => r()));
+  // keep sending pings — under the old code the FIRST message defused the timer
+  const pinger = setInterval(() => {
+    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "ping", ts: 1 }));
+  }, 40);
+  const code = await new Promise<number>((r) => ws.once("close", (c) => r(c)));
+  clearInterval(pinger);
+  assert.equal(code, 1008, "authenticated-but-never-started socket must be closed at the pre-start deadline");
+  server.close();
 });

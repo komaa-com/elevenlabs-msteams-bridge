@@ -12,6 +12,9 @@ import type { VideoFrameMessage } from "./protocol.js";
 
 export type VisionDescriber = (frame: VideoFrameMessage, question: string) => Promise<string>;
 
+/** Hard bound on the vision-model round trip; the agent is mid-call waiting on the tool result. */
+const VISION_TIMEOUT_MS = 20_000;
+
 export function makeVisionDescriber(cfg: BridgeConfig): VisionDescriber | null {
   if (!cfg.visionApiUrl || !cfg.visionModel) {
     return null;
@@ -27,6 +30,9 @@ export function makeVisionDescriber(cfg: BridgeConfig): VisionDescriber | null {
         : `camera of ${frame.participantName ?? "the caller"}`;
     const res = await fetch(url, {
       method: "POST",
+      // Bounded like every other outbound call: a hung vision endpoint must not
+      // hold the agent's `look` tool call (and its promise) open forever.
+      signal: AbortSignal.timeout(VISION_TIMEOUT_MS),
       headers: {
         "content-type": "application/json",
         ...(key ? { authorization: `Bearer ${key}` } : {}),

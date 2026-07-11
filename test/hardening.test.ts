@@ -29,6 +29,7 @@ const baseCfg: BridgeConfig = {
   maxConnections: 0,
   maxConnectionsPerIp: 0,
   preStartTimeoutMs: 0,
+  workerIdleTimeoutMs: 0,
   trustProxy: false,
   tlsCertPath: null,
   tlsKeyPath: null,

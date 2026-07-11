@@ -29,6 +29,7 @@ const cfg: BridgeConfig = {
   maxConnections: 0,
   maxConnectionsPerIp: 0,
   preStartTimeoutMs: 0,
+  workerIdleTimeoutMs: 0,
   trustProxy: false,
   tlsCertPath: null,
   tlsKeyPath: null,
@@ -230,6 +231,19 @@ test("full relay: init, audio both ways, barge-in ghosts, ping/pong, context, go
   // client tool: unknown → tool error, call keeps running
   fakeAgent.emit({ type: "client_tool_call", client_tool_call: { tool_name: "teleport", tool_call_id: "t3" } });
   await until(() => fakeAgent.sent.find((m) => m.type === "client_tool_result" && m.tool_call_id === "t3" && m.is_error === true));
+
+  // inline show_image over the 5 MB cap → tool error (same bound as the URL path)
+  fakeAgent.emit({
+    type: "client_tool_call",
+    client_tool_call: {
+      tool_name: "show_image",
+      tool_call_id: "t3b",
+      parameters: { dataBase64: "A".repeat(7_100_000), mime: "image/png" },
+    },
+  });
+  const oversize = await until(() => fakeAgent.sent.find((m) => m.tool_call_id === "t3b"));
+  assert.equal(oversize.is_error, true);
+  assert.match(String(oversize.result), /too large/);
 
   // SSRF: show_image with a metadata/loopback URL → tool error, nothing displayed
   fakeAgent.emit({

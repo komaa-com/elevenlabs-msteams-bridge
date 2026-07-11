@@ -48,6 +48,13 @@ const GOODBYE_HARD_CAP_MS = 8_000;
  *  flapping between speakers cannot spam the agent. */
 const SPEAKER_UPDATE_MIN_INTERVAL_MS = 5_000;
 
+/** Dead-peer window: worker heartbeats every 30 s → 3 missed pings ends the call. */
+const DEFAULT_WORKER_IDLE_TIMEOUT_MS = 90_000;
+
+/** Inline show_image dataBase64 cap — same 5 MB bound as the URL path,
+ *  expressed in base64 characters (4 chars per 3 bytes). */
+const MAX_INLINE_IMAGE_B64_CHARS = Math.ceil(MAX_IMAGE_BYTES / 3) * 4;
+
 /** Injectable EL connector so tests can substitute a fake agent. */
 export type ElConnector = (cfg: BridgeConfig, log: Logger, handlers: ElSessionHandlers) => Promise<AgentPort>;
 
@@ -109,6 +116,15 @@ export class CallSession {
   // invoked exactly once when the session tears down (server uses it to de-register)
   private readonly onClosed: (() => void) | undefined;
 
+  // Dead-peer detection: the worker heartbeats every 30 s, but a half-open TCP
+  // socket (NAT timeout, node crash, network drop without FIN) delivers nothing
+  // and never fires 'close' — the session would stay "live" for hours, holding
+  // the billed EL conversation open AND 409-blocking every reconnect for this
+  // callId. Track the last inbound worker message and tear down after the idle
+  // window (default 90 s = 3 missed heartbeats).
+  private lastWorkerActivityMs = Date.now();
+  private idleTimer: NodeJS.Timeout | null = null;
+
   constructor(
     cfg: BridgeConfig,
     worker: WebSocket,
@@ -126,6 +142,7 @@ export class CallSession {
     this.onClosed = onClosed;
 
     worker.on("message", (data) => {
+      this.lastWorkerActivityMs = Date.now(); // any inbound frame proves the peer is alive
       // parity with the EL side: a handler throw must not escape the ws
       // listener (uncaught exception → process down)
       try {
@@ -139,6 +156,20 @@ export class CallSession {
       this.log.warn(`worker socket error: ${(err as Error).message}`);
       this.teardown("worker-error");
     });
+
+    const idleMs = cfg.workerIdleTimeoutMs > 0 ? cfg.workerIdleTimeoutMs : DEFAULT_WORKER_IDLE_TIMEOUT_MS;
+    this.idleTimer = setInterval(() => {
+      if (Date.now() - this.lastWorkerActivityMs > idleMs) {
+        this.log.warn(`no worker message in ${idleMs}ms (dead peer?); ending the call`);
+        this.endCall("worker-idle-timeout");
+      }
+    }, Math.max(20, Math.min(idleMs / 3, 30_000)));
+    this.idleTimer.unref?.();
+  }
+
+  /** Whether session.start has arrived (the server's pre-start timer asks). */
+  get hasStarted(): boolean {
+    return this.sessionStarted;
   }
 
   // ---- worker → bridge ----
@@ -480,6 +511,9 @@ export class CallSession {
   private async onShowImage(toolCallId: string, params: Record<string, unknown>): Promise<void> {
     try {
       let dataBase64 = typeof params.dataBase64 === "string" ? params.dataBase64 : null;
+      if (dataBase64 && dataBase64.length > MAX_INLINE_IMAGE_B64_CHARS) {
+        throw new Error(`inline image too large (${dataBase64.length} base64 chars, max ${MAX_INLINE_IMAGE_B64_CHARS})`);
+      }
       let mime = typeof params.mime === "string" ? params.mime : null;
       const url = typeof params.url === "string" ? params.url : null;
       if (!dataBase64 && url) {
@@ -648,7 +682,11 @@ export class CallSession {
     // bufferedAmount grows unbounded (50 audio.frames/s) and leaks memory.
     // Above the cap, drop this frame rather than queue it — audio is realtime,
     // a stale frame is worthless, and this bounds memory (parity with siblings).
-    if (this.worker.bufferedAmount > MAX_OUTBOUND_BUFFER_BYTES) {
+    // ONLY the bulky realtime types are droppable: control frames (assistant.cancel,
+    // session.end, pong, expression) are tiny and semantically load-bearing — a
+    // stalled-then-recovered worker must not miss a barge-in cancel or a hangup.
+    const droppable = msg.type === "audio.frame" || msg.type === "display.image";
+    if (droppable && this.worker.bufferedAmount > MAX_OUTBOUND_BUFFER_BYTES) {
       // Throttle the log: at ~50 frames/s a stalled worker would emit 50 warn
       // lines/s. Count drops and warn at most once per second with the total.
       this.droppedFrames++;
@@ -692,6 +730,10 @@ export class CallSession {
     if (this.goodbyeTimer) {
       clearTimeout(this.goodbyeTimer);
       this.goodbyeTimer = null;
+    }
+    if (this.idleTimer) {
+      clearInterval(this.idleTimer);
+      this.idleTimer = null;
     }
     try {
       this.el?.close();

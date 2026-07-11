@@ -55,6 +55,7 @@ The bridge is configured entirely from environment variables. The package ships 
 | `MAX_CONNECTIONS` | `0` (= 64) | Max concurrent connections. |
 | `MAX_CONNECTIONS_PER_IP` | `0` (= 8) | Max concurrent connections from one remote IP. |
 | `PRE_START_TIMEOUT_MS` | `0` (= 10000) | Drop a connection that authenticates but never sends `session.start`. |
+| `WORKER_IDLE_TIMEOUT_MS` | `0` (= 90000) | Dead-peer window: end the call after this long without any worker message (the worker heartbeats every 30 s). Frees the call id for reconnect and closes the billed ElevenLabs conversation. |
 | `LOG_TRANSCRIPTS` | `false` | Log ElevenLabs transcripts (still gated on Teams `recording.status == "active"`). |
 | `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error`. An invalid value falls back to `info`. |
 

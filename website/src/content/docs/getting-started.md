@@ -82,4 +82,12 @@ More detail (tiers, what pairing does, cutoff behavior): [Connecting to StandIn]
 
 ## 4. Make the first call
 
-Call your Teams bot (or join the sandbox meeting). In the bridge logs you should see the call arrive,
+Call your Teams bot (or join the sandbox meeting). In the bridge logs you should see the call arrive, the ElevenLabs session open, and the relay start:
+
+```text
+INFO  [server] worker connected for call 19:meeting_ab… (1/64)
+INFO  [call:19:meeting_ab] session.start (direction=inbound, recording=unknown)
+INFO  [call:19:meeting_ab] ElevenLabs agent session open; relaying
+```
+
+Speak, and the agent answers in its own voice. If the call connects but something is off, [Troubleshooting](/elevenlabs-msteams-bridge/troubleshooting/) maps every error you are likely to see (`401` handshake, `agent-unavailable`, garbled-audio format mismatch) to its cause.
