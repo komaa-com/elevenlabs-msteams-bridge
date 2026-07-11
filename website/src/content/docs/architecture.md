@@ -7,13 +7,17 @@ The bridge is a small, stateless-per-call relay. It holds two WebSockets per cal
 
 ## System overview
 
-```text
-  Microsoft Teams          StandIn media bridge           this bridge                 ElevenLabs Agent
-   (voice/video call)  ⇄     (hosted service)      ──HMAC WS──▶  (Node/TS)   ──WS──▶   (STT + LLM + TTS + VAD)
-                                                    one WS per call            one conversation per call
-                            joins the call,          verifies HMAC,            relays audio verbatim,
-                            speaks the wire           terminates the wire       maps barge-in, injects
-                            protocol                  protocol                  context, runs governors
+```mermaid
+flowchart LR
+    Teams["Microsoft Teams<br/>voice/video call"]
+    StandIn["StandIn media bridge<br/>(hosted)<br/>joins the call, speaks<br/>the wire protocol"]
+    Bridge["this bridge (Node/TS)<br/>verifies HMAC, terminates<br/>the wire protocol,<br/>one WS per call"]
+    EL["ElevenLabs Agent<br/>STT + LLM + TTS + VAD<br/>one conversation per call"]
+
+    Teams <--> StandIn
+    StandIn -- "HMAC WebSocket" --> Bridge
+    Bridge -- "Agent WebSocket" --> EL
+    Bridge -. "relay audio verbatim,<br/>map barge-in, inject<br/>context, run governors" .-> EL
 ```
 
 The StandIn media bridge handles everything about Teams itself and exposes each call as a single WebSocket carrying `audio.frame` (PCM 16 kHz), `video.frame` (JPEG) and control messages. This bridge has no idea what is on the other end of the Teams call - it only speaks the wire protocol.
@@ -24,24 +28,15 @@ Both sides speak base64 **PCM 16 kHz, 16-bit, mono**. The Teams side sends `audi
 
 ## Call lifecycle
 
-```text
-  upgrade + HMAC verify        (401 on bad/replayed/stale signature; 409 if callId already live)
-        │
-        ▼
-  session.start                (callId cross-checked vs the URL; 10s pre-start timeout if it never arrives)
-        │
-        ▼
-  connect ElevenLabs           (signed URL minted per call; caller audio buffered ~5s while connecting)
-        │
-        ▼
-  relay  audio.frame ⇄ user_audio_chunk / audio_event
-         interruption → assistant.cancel + ghost-drop
-         participants / dtmf → contextual_update
-         look / show_image / express / end_call  (agent client tools)
-        │
-        ▼
-  teardown  (worker close, agent close, session.end, governor, or SIGTERM)
-            closes BOTH sockets exactly once, clears timers, de-registers the call
+```mermaid
+flowchart TD
+    A["upgrade + HMAC verify<br/>401 on bad / replayed / stale signature<br/>409 if callId already live"]
+    B["session.start<br/>callId cross-checked vs the URL<br/>10s pre-start timeout if it never arrives"]
+    C["connect ElevenLabs<br/>signed URL minted per call<br/>caller audio buffered ~5s while connecting"]
+    D["relay<br/>audio.frame &lt;-&gt; user_audio_chunk / audio_event<br/>interruption -&gt; assistant.cancel + ghost-drop<br/>participants / dtmf -&gt; contextual_update<br/>look / show_image / express / end_call"]
+    E["teardown<br/>worker close, agent close, session.end,<br/>governor, or SIGTERM<br/>closes BOTH sockets once, clears timers,<br/>de-registers the call"]
+
+    A --> B --> C --> D --> E
 ```
 
 Barge-in is handled by dropping any ElevenLabs `audio` event whose `event_id` is at or below the interrupted one, so stale agent audio never plays after the caller cuts in ("ghost drop").

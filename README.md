@@ -30,11 +30,15 @@ The hot path is **copy-only**: both sides speak base64 PCM 16 kHz mono (`pcm_160
 
 ## Install
 
-```bash
-# run directly
-npx @komaa/elevenlabs-msteams-bridge
+Run it directly:
 
-# or add it to your project
+```bash
+npx @komaa/elevenlabs-msteams-bridge
+```
+
+Or add it to your project:
+
+```bash
 npm install @komaa/elevenlabs-msteams-bridge
 ```
 

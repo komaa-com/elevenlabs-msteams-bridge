@@ -11,9 +11,15 @@ This bridge does not join Teams calls itself. That is the job of **StandIn** (th
 - **The StandIn media bridge is the client.** For each Teams call it opens **one WebSocket** to your bridge, appending the call id to the URL path (the call id is the last path segment).
 - **Authentication is HMAC over a shared secret.** Both sides hold the same secret. On the WebSocket upgrade, StandIn sends two headers whose signature is `HMAC-SHA256(secret, "{timestampMs}.{callId}")`. The bridge verifies it (constant-time, inside a 60 s freshness window, with a single-use replay guard) before accepting the connection. A mismatch is rejected with `401`.
 
-```text
- Teams call ⇄  StandIn media bridge  ──HMAC WS──▶  your-host:8080  (this bridge)  ──WS──▶  ElevenLabs Agent
-   (hosted)     dials {url}/{callId} with X-OpenClawTeamsBridge-Timestamp / -Signature
+```mermaid
+flowchart LR
+    Teams["Teams call"]
+    StandIn["StandIn media bridge<br/>(hosted)<br/>dials {url}/{callId} with<br/>X-OpenClawTeamsBridge-Timestamp / -Signature"]
+    Bridge["your-host:8080<br/>(this bridge)"]
+    EL["ElevenLabs Agent"]
+    Teams <--> StandIn
+    StandIn -- "HMAC WS" --> Bridge
+    Bridge -- "WS" --> EL
 ```
 
 From the bridge's point of view **the connection is identical across all tiers** - same server, same HMAC WebSocket, same protocol. The tier only decides which StandIn identity and which limits apply.

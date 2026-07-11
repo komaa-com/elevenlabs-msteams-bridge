@@ -7,9 +7,15 @@ Welcome! **`@komaa/elevenlabs-msteams-bridge`** (npm: [`@komaa/elevenlabs-msteam
 
 It is a small Node.js service (and importable TypeScript library) that sits between two WebSockets:
 
-```text
-Microsoft Teams ⇄ StandIn media bridge ──HMAC WS──▶ this bridge ──WS──▶ ElevenLabs Agent
-      (call)          (hosted service)                 (yours)          (STT+LLM+TTS+VAD)
+```mermaid
+flowchart LR
+    Teams["Microsoft Teams<br/>call"]
+    StandIn["StandIn media bridge<br/>(hosted service)"]
+    Bridge["this bridge<br/>(yours)"]
+    EL["ElevenLabs Agent<br/>STT + LLM + TTS + VAD"]
+    Teams <--> StandIn
+    StandIn -- "HMAC WS" --> Bridge
+    Bridge -- "WS" --> EL
 ```
 
 The hosted **StandIn media bridge** ([standin.komaa.com](https://standin.komaa.com)) joins the Teams call and dials into your bridge, one authenticated WebSocket per call. The bridge opens one ElevenLabs Agent conversation per call and relays between them. Both sides speak base64 **PCM 16 kHz mono**, so audio is copied **verbatim** in both directions: no resampling, no re-encoding, nothing added to the latency budget beyond a relay hop.
