@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { IncomingMessage } from "node:http";
-import { ReplayGuard, authorizeUpgrade } from "../src/server.js";
+import { ReplayGuard, authorizeUpgrade, callIdFromUrl } from "../src/server.js";
 import { sign, TIMESTAMP_HEADER, SIGNATURE_HEADER } from "../src/hmac.js";
 import { loadConfig, type BridgeConfig } from "../src/config.js";
 
@@ -29,6 +29,9 @@ const baseCfg: BridgeConfig = {
   maxConnections: 0,
   maxConnectionsPerIp: 0,
   preStartTimeoutMs: 0,
+  trustProxy: false,
+  tlsCertPath: null,
+  tlsKeyPath: null,
   logTranscripts: false,
 };
 
@@ -92,5 +95,35 @@ test("EL_HOST is restricted to elevenlabs.io hosts (API-key exfil guard)", () =>
     assert.equal(loadConfig().elHost, "evil.example.com", "explicit override honored");
   } finally {
     process.env = saved;
+  }
+});
+
+// HIGH (review round 3): a malformed percent-escape in the upgrade path must NOT
+// throw (that would be an uncaught exception → process crash, pre-auth).
+test("callIdFromUrl returns null for a malformed percent-escape (no throw)", () => {
+  assert.equal(callIdFromUrl("/voice/msteams/stream/%zz"), null);
+  assert.equal(callIdFromUrl("/%E0%A4%A"), null); // truncated escape
+  assert.equal(callIdFromUrl("/voice/stream/call%20123"), "call 123"); // valid still decodes
+});
+
+test("authorizeUpgrade rejects a malformed-escape URL instead of throwing", () => {
+  const req = { url: "/voice/msteams/stream/%zz", headers: {}, socket: {} } as unknown as IncomingMessage;
+  const res = authorizeUpgrade({ ...baseCfg, workerSharedSecret: SECRET }, req, new ReplayGuard(60_000));
+  assert.ok("error" in res && res.error === "no callId in path");
+});
+
+// Fail-loud on negative numerics (a typo like MAX_CALL_MINUTES=-1 would otherwise
+// pass Number.isFinite and silently disable the governor).
+test("loadConfig throws on a negative MAX_CALL_MINUTES", () => {
+  const prev = process.env.MAX_CALL_MINUTES;
+  process.env.WORKER_SHARED_SECRET = "s";
+  process.env.ELEVENLABS_API_KEY = "k";
+  process.env.ELEVENLABS_AGENT_ID = "a";
+  process.env.MAX_CALL_MINUTES = "-1";
+  try {
+    assert.throws(() => loadConfig(), /MAX_CALL_MINUTES.*must not be negative/);
+  } finally {
+    if (prev === undefined) delete process.env.MAX_CALL_MINUTES;
+    else process.env.MAX_CALL_MINUTES = prev;
   }
 });
