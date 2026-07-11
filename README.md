@@ -62,19 +62,58 @@ import { loadConfig, startServer } from "@komaa/elevenlabs-msteams-bridge";
 startServer(loadConfig());
 ```
 
-With a custom vision hook (path-2 `look`: your model, your prompt, the raw frame never leaves your process):
+With a custom vision hook (path-2 `look`: your model, your prompt, the raw frame never leaves your process). This example sends the frame to OpenAI's vision model and returns the description to the agent. Install the SDK alongside the bridge: `npm i openai`.
 
 ```ts
+import OpenAI from "openai";
 import { loadConfig, startServer, type VisionDescriber } from "@komaa/elevenlabs-msteams-bridge";
 
-const myVision: VisionDescriber = async (frame, question) => {
-  // frame: { source, mime, dataBase64, width, height, participantName?, ... }
-  const description = await myModel.describe(Buffer.from(frame.dataBase64, "base64"), question);
-  return description; // returned to the agent as the `look` tool result
+const openai = new OpenAI(); // reads OPENAI_API_KEY
+
+// frame: { source: "camera" | "screenshare", mime, dataBase64, width, height, participantName?, ... }
+const describeWithOpenAI: VisionDescriber = async (frame, question) => {
+  const who = frame.source === "screenshare" ? "the caller's shared screen" : "the caller's camera";
+  const res = await openai.chat.completions.create({
+    model: "gpt-4o", // any vision-capable model
+    max_tokens: 300,
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: `This is ${who}. ${question}` },
+          {
+            type: "image_url",
+            image_url: {
+              url: `data:${frame.mime};base64,${frame.dataBase64}`,
+              detail: "low", // keep it fast and cheap for a live call
+            },
+          },
+        ],
+      },
+    ],
+  });
+  // returned to the agent as the `look` tool result
+  return res.choices[0]?.message?.content ?? "I could not make out the image.";
 };
 
-startServer(loadConfig(), undefined, myVision);
+startServer(loadConfig(), undefined, describeWithOpenAI);
 ```
+
+**Azure OpenAI** is the same call with a different client (use your deployment name as the model):
+
+```ts
+import { AzureOpenAI } from "openai";
+
+const openai = new AzureOpenAI({
+  endpoint: process.env.AZURE_OPENAI_ENDPOINT,   // https://<resource>.openai.azure.com
+  apiKey: process.env.AZURE_OPENAI_API_KEY,
+  apiVersion: "2024-10-21",
+  deployment: "gpt-4o",                          // your Azure deployment name
+});
+// ...then call openai.chat.completions.create({ model: "gpt-4o", ... }) exactly as above.
+```
+
+> The bridge's built-in path 2 (set `VISION_API_URL` / `VISION_MODEL` / `VISION_API_KEY`) already calls any OpenAI-compatible `/chat/completions` endpoint for you, no code required. Write a custom `VisionDescriber` only when you need a different model, provider, or prompt.
 
 A complete runnable project lives in [`examples/basic-bridge/`](./examples/basic-bridge/). The full programmatic surface (custom agent transports, HMAC helpers, protocol types) is documented in the [Library API](https://komaa-com.github.io/elevenlabs-msteams-bridge/library-api/) page.
 
