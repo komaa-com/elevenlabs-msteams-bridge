@@ -129,6 +129,8 @@ StandIn is the hosted service that joins the Teams call and dials into this brid
 2. Set `WORKER_SHARED_SECRET` to the **shared secret from pairing** - the two sides must match exactly, or the handshake is rejected with 401.
 3. Call your Teams bot (or the sandbox meeting). StandIn joins, dials the bridge, and your ElevenLabs agent answers.
 
+> **Use TLS (wss).** The bridge listens on plain WS by default, so caller audio and video would cross the wire in plaintext. Terminate TLS in front of it (a tunnel such as Tailscale Funnel, an ingress, or a load balancer), **or** set `TLS_CERT_PATH` + `TLS_KEY_PATH` to have the bridge serve `wss://` natively. Always give StandIn a `wss://` URL.
+
 Details and the tier walk-through: [Connecting to StandIn](https://komaa-com.github.io/elevenlabs-msteams-bridge/connecting-to-standin/).
 
 ## Configuration
