@@ -47,8 +47,36 @@ Every option is an environment variable; the package ships a fully commented [`.
 StandIn is the hosted service that joins the Teams call and dials into your bridge. Pick a tier at [standin.komaa.com](https://standin.komaa.com) (sandbox for an instant trial), pair, and you get a **shared secret**.
 
 1. Put the secret in `WORKER_SHARED_SECRET` (both sides must match exactly).
-2. Point the identity's **agent WebSocket URL** at your bridge, for example `wss://el-bridge.example.com:8080/voice/msteams/stream`. StandIn appends `/{callId}` per call. The URL must be reachable from the internet (a public endpoint or a tunnel).
+2. Point the identity's **agent WebSocket URL** at your bridge, for example `wss://el-bridge.example.com:8080/voice/msteams/stream`. StandIn appends `/{callId}` per call.
 3. Restart the bridge if you changed the env.
+
+StandIn dials in **from the internet**, so a laptop or private host needs a public URL. A tunnel gives you one and terminates TLS (so you get `wss://` for free). Run one pointing at port `8080`, then use the `wss://…/voice/msteams/stream` form of the printed host:
+
+Tailscale Funnel:
+
+```bash
+tailscale funnel --bg --https=8080 8080
+```
+
+Cloudflare Tunnel:
+
+```bash
+cloudflared tunnel --url http://localhost:8080
+```
+
+ngrok:
+
+```bash
+ngrok http 8080
+```
+
+VS Code dev tunnels:
+
+```bash
+devtunnel host -p 8080 --allow-anonymous
+```
+
+For a fixed production host use an ingress/load balancer, or serve TLS natively with `TLS_CERT_PATH` + `TLS_KEY_PATH`. Never give StandIn a plain `ws://` URL outside local testing.
 
 More detail (tiers, what pairing does, cutoff behavior): [Connecting to StandIn](/elevenlabs-msteams-bridge/connecting-to-standin/).
 
