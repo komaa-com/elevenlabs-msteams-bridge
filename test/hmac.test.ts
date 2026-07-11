@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
 import { sign, verify, isFresh } from "../src/hmac.js";
 
-// Fixed vector: mirrors HmacSigner.cs — HMAC-SHA256(secret, "{timestampMs}.{callId}") hex-lower.
+// Fixed vector for the HMAC-SHA256(secret, "{timestampMs}.{callId}") hex-lower handshake the StandIn media bridge uses.
 // Recompute independently here so a refactor of sign() can't silently drift.
 test("sign matches the C# HmacSigner recipe", () => {
   const secret = "test-secret";
