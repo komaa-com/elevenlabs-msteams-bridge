@@ -97,7 +97,7 @@ import { sign, verify, isFresh, TIMESTAMP_HEADER, SIGNATURE_HEADER } from "@koma
 
 const ts = Date.now();
 const signature = sign(secret, ts, callId); // HMAC-SHA256(secret, `${ts}.${callId}`) hex
-// send as headers X-OpenClawTeamsBridge-Timestamp / -Signature
+// send as headers X-StandIn-Timestamp / -Signature
 verify(secret, ts, callId, signature); // constant-time, false on any missing input
 isFresh(ts, 60_000);                    // within the freshness window?
 ```

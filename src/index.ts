@@ -25,6 +25,6 @@ export {
   type ElSessionHandlers,
   type ConversationInitOptions,
 } from "./elevenlabs.js";
-export { sign, verify, isFresh, TIMESTAMP_HEADER, SIGNATURE_HEADER } from "./hmac.js";
+export { sign, verify, isFresh, TIMESTAMP_HEADER, SIGNATURE_HEADER, LEGACY_TIMESTAMP_HEADER, LEGACY_SIGNATURE_HEADER } from "./hmac.js";
 export * from "./protocol.js";
 export { logger, type Logger } from "./log.js";
