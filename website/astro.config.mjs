@@ -10,6 +10,15 @@ export default defineConfig({
     // Client-side Mermaid rendering (theme-aware, offline). Must come BEFORE starlight.
     mermaid({ theme: "default", autoTheme: true }),
     starlight({
+      head: [
+        // Google Analytics 4 (shared StandIn property; filter by hostname in GA).
+        { tag: "script", attrs: { async: true, src: "https://www.googletagmanager.com/gtag/js?id=G-M02N9C42XH" } },
+        {
+          tag: "script",
+          content:
+            "window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-M02N9C42XH');",
+        },
+      ],
       title: "Microsoft Teams Bridge for ElevenLabs Agents",
       description:
         "Put an ElevenLabs Agent on a real Microsoft Teams call: verbatim PCM16k audio relay, barge-in, vision on demand, and call governors, connected through the StandIn media bridge.",
