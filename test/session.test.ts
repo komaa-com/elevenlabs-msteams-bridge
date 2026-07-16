@@ -216,6 +216,14 @@ test("full relay: init, audio both ways, barge-in ghosts, ping/pong, context, go
   assert.deepEqual(expr, { type: "expression", emotion: "happy" });
   await until(() => fakeAgent.sent.find((m) => m.type === "client_tool_result" && m.tool_call_id === "t1" && m.is_error === false));
 
+  // BRIDGE-6: an over-long emotion is rejected (tool error) and emits no
+  // expression frame — the next worker frame is the following valid express.
+  fakeAgent.emit({ type: "client_tool_call", client_tool_call: { tool_name: "express", tool_call_id: "t1b", parameters: { emotion: "x".repeat(200) } } });
+  await until(() => fakeAgent.sent.find((m) => m.type === "client_tool_result" && m.tool_call_id === "t1b" && m.is_error === true));
+  const expr2P = nextMessage(ws);
+  fakeAgent.emit({ type: "client_tool_call", client_tool_call: { tool_name: "express", tool_call_id: "t1c", parameters: { emotion: "sad" } } });
+  assert.deepEqual(await expr2P, { type: "expression", emotion: "sad" });
+
   // client tool: show_image (inline base64) → display.image to worker
   const imgP = nextMessage(ws);
   fakeAgent.emit({
