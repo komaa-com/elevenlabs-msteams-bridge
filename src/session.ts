@@ -56,6 +56,13 @@ const DEFAULT_WORKER_IDLE_TIMEOUT_MS = 90_000;
  *  expressed in base64 characters (4 chars per 3 bytes). */
 const MAX_INLINE_IMAGE_B64_CHARS = Math.ceil(MAX_IMAGE_BYTES / 3) * 4;
 
+/** Length caps on agent-supplied control-frame strings. `expression` is
+ *  undroppable, so an unbounded `emotion` would bypass the outbound memory
+ *  bound; caption/mode are bounded for the same reason. Mirrors OpenAI/Deepgram. */
+const MAX_EMOTION_CHARS = 64;
+const MAX_CAPTION_CHARS = 500;
+const MAX_MODE_CHARS = 32;
+
 /** Injectable EL connector so tests can substitute a fake agent. */
 export type ElConnector = (cfg: BridgeConfig, log: Logger, handlers: ElSessionHandlers) => Promise<AgentPort>;
 
@@ -482,9 +489,13 @@ export class CallSession {
         this.endCall("agent-ended-call");
         return;
       case "express": {
-        const emotion = typeof params.emotion === "string" ? params.emotion : "";
+        const emotion = typeof params.emotion === "string" ? params.emotion.trim() : "";
         if (!emotion) {
           this.el?.sendClientToolResult(call.tool_call_id, "express requires an 'emotion' parameter", true);
+          return;
+        }
+        if (emotion.length > MAX_EMOTION_CHARS) {
+          this.el?.sendClientToolResult(call.tool_call_id, `express: 'emotion' must be at most ${MAX_EMOTION_CHARS} characters`, true);
           return;
         }
         this.sendToWorker({ type: "expression", emotion });
@@ -536,9 +547,9 @@ export class CallSession {
         dataBase64,
         mime,
         durationMs: typeof params.durationMs === "number" ? params.durationMs : null,
-        mode: typeof params.mode === "string" ? params.mode : null,
+        mode: typeof params.mode === "string" ? params.mode.slice(0, MAX_MODE_CHARS) : null,
         ts: 0,
-        caption: typeof params.caption === "string" ? params.caption : null,
+        caption: typeof params.caption === "string" ? params.caption.slice(0, MAX_CAPTION_CHARS) : null,
       });
       this.el?.sendClientToolResult(toolCallId, "image is being shown to the caller", false);
     } catch (err) {

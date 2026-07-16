@@ -2,7 +2,7 @@ import { createServer, type IncomingMessage, type Server } from "node:http";
 import { createServer as createHttpsServer } from "node:https";
 import { readFileSync } from "node:fs";
 import type { Duplex } from "node:stream";
-import { WebSocketServer } from "ws";
+import { WebSocketServer, type WebSocket } from "ws";
 import type { BridgeConfig } from "./config.js";
 import { isFresh, verify, LEGACY_SIGNATURE_HEADER, LEGACY_TIMESTAMP_HEADER, SIGNATURE_HEADER, TIMESTAMP_HEADER } from "./hmac.js";
 import { logger } from "./log.js";
@@ -25,6 +25,9 @@ const log = logger("server");
 /** Max inbound WS frame. Caller audio is ~640 B/frame; a JPEG video.frame is the
  *  large one. 2 MB matches the sibling providers and bounds a single message. */
 const MAX_INBOUND_PAYLOAD_BYTES = 2 * 1024 * 1024;
+
+/** WS-level ping interval; a client that misses a pong is terminated next tick. */
+const WORKER_HEARTBEAT_MS = 30_000;
 /** Max concurrent worker connections (one per live call). */
 const DEFAULT_MAX_CONNECTIONS = 64;
 /** A worker that authenticates but never sends session.start is dropped after this. */
@@ -223,6 +226,28 @@ export function startServer(
 
   const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_INBOUND_PAYLOAD_BYTES });
 
+  // WS-level heartbeat: a half-open worker socket (NAT drop, peer crash) delivers
+  // neither a close nor data. Ping every 30 s and terminate a client that missed
+  // the previous pong, so a dead socket is reclaimed in ~1 interval instead of
+  // waiting out the session idle timer (during which the callId 409-blocks
+  // reconnects). Parity with the Python siblings' aiohttp heartbeat=30.
+  const heartbeat = setInterval(() => {
+    for (const client of wss.clients) {
+      const c = client as WebSocket & { isAlive?: boolean };
+      if (c.isAlive === false) {
+        c.terminate();
+        continue;
+      }
+      c.isAlive = false;
+      try {
+        c.ping();
+      } catch {
+        /* socket already closing */
+      }
+    }
+  }, WORKER_HEARTBEAT_MS);
+  heartbeat.unref?.();
+
   const reject = (socket: Duplex, status: string, reason: string, ip: string): void => {
     log.warn(`rejected upgrade from ${ip}: ${reason}`);
     socket.write(`HTTP/1.1 ${status}\r\n\r\n`);
@@ -289,6 +314,11 @@ export function startServer(
     socket.once("close", releaseSlots); // covers the never-adopted path
 
     wss.handleUpgrade(req, socket, head, (ws) => {
+      const alive = ws as WebSocket & { isAlive?: boolean };
+      alive.isAlive = true;
+      ws.on("pong", () => {
+        alive.isAlive = true;
+      });
       log.info(`worker connected for call ${auth.callId.slice(0, 12)}… (${openConnections}/${maxConnections})`);
       metricInc("bridge_calls_total");
       metricInc("bridge_calls_active");
@@ -327,7 +357,10 @@ export function startServer(
     });
   }
 
-  httpServer.on("close", () => liveRegistries.delete(sessions));
+  httpServer.on("close", () => {
+    clearInterval(heartbeat);
+    liveRegistries.delete(sessions);
+  });
 
   httpServer.listen(cfg.port, cfg.host, () => {
     log.info(`elevenlabs-msteams-bridge listening on ${cfg.host}:${cfg.port} (agent ${cfg.elevenLabsAgentId}, host ${cfg.elHost})`);
