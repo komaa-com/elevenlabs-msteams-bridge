@@ -648,7 +648,9 @@ export class CallSession {
         // frame, so playback does not depend on the worker re-aligning a giant
         // chunk (parity with normal relay).
         for (let off = 0; off < pcm.length; off += PCM16K_FRAME_BYTES) {
-          this.emitAudioToWorker(pcm.subarray(off, off + PCM16K_FRAME_BYTES).toString("base64"));
+          // undroppable: the goodbye is the deterministic compliance line at call-end,
+          // so it must play even if the worker socket is backpressured (parity w/ deepgram).
+          this.emitAudioToWorker(pcm.subarray(off, off + PCM16K_FRAME_BYTES).toString("base64"), true);
         }
         return pcm16kBytesToMs(pcm.length);
       } catch (err) {
@@ -662,7 +664,7 @@ export class CallSession {
 
   // ---- plumbing ----
 
-  private emitAudioToWorker(base64Pcm: string): void {
+  private emitAudioToWorker(base64Pcm: string, undroppable = false): void {
     const frame: AudioFrameMessage = {
       type: "audio.frame",
       seq: this.outSeq++,
@@ -672,10 +674,10 @@ export class CallSession {
     // advance the timeline by the actual PCM duration (base64 → bytes → ms)
     this.outTimestampMs += pcm16kBytesToMs(Buffer.byteLength(base64Pcm, "base64"));
     metricInc("bridge_frames_to_worker_total");
-    this.sendToWorker(frame);
+    this.sendToWorker(frame, undroppable);
   }
 
-  private sendToWorker(msg: WorkerOutbound): void {
+  private sendToWorker(msg: WorkerOutbound, undroppable = false): void {
     if (this.worker.readyState !== this.worker.OPEN) {
       return;
     }
@@ -683,10 +685,13 @@ export class CallSession {
     // bufferedAmount grows unbounded (50 audio.frames/s) and leaks memory.
     // Above the cap, drop this frame rather than queue it — audio is realtime,
     // a stale frame is worthless, and this bounds memory (parity with siblings).
-    // ONLY the bulky realtime types are droppable: control frames (assistant.cancel,
-    // session.end, pong, expression) are tiny and semantically load-bearing — a
-    // stalled-then-recovered worker must not miss a barge-in cancel or a hangup.
-    const droppable = msg.type === "audio.frame" || msg.type === "display.image";
+    // ONLY the continuous realtime audio.frame (~50/s) is droppable. display.image is a
+    // ONE-SHOT the agent is told succeeded ("image is being shown to the caller"), so
+    // dropping it desyncs the agent's belief from what the caller sees; and control frames
+    // (assistant.cancel, session.end, pong, expression) are tiny + load-bearing. The
+    // deterministic goodbye TTS also passes undroppable so a backpressured call-end still
+    // plays the compliance line.
+    const droppable = msg.type === "audio.frame" && !undroppable;
     if (droppable && this.worker.bufferedAmount > MAX_OUTBOUND_BUFFER_BYTES) {
       // Throttle the log: at ~50 frames/s a stalled worker would emit 50 warn
       // lines/s. Count drops and warn at most once per second with the total.
