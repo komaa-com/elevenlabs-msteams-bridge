@@ -10,6 +10,8 @@
 
 **`@komaa/elevenlabs-msteams-bridge`** puts an [ElevenLabs Agent](https://elevenlabs.io/docs/eleven-agents/api-reference/eleven-agents/websocket) on a real **Microsoft Teams call**. The hosted **StandIn media bridge** ([standin.komaa.com](https://standin.komaa.com)) joins the Teams call and dials into this bridge over an HMAC-authenticated WebSocket; the bridge opens one ElevenLabs Agent conversation per call and relays between them.
 
+> **Prefer Python?** The same bridge exists as a Python package: [`elevenlabs-msteams-bridge` on PyPI](https://pypi.org/project/elevenlabs-msteams-bridge/) ([repo](https://github.com/komaa-com/elevenlabs-msteams-bridge-py)) - same wire protocol, same environment variables, drop-in interchangeable behind the same `.env` file. The Node and Python packages version independently; both implement the same StandIn wire protocol and interoperate with the hosted service identically.
+
 ```text
 Microsoft Teams call
        |
